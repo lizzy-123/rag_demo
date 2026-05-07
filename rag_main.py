@@ -1,178 +1,526 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-RAG 团队知识助手 - 可切换模型（智谱AI / OpenAI）
-使用 LangChain 1.x 组件，兼容 langchain-zhipu 包
-"""
-
-"""
-之后需要调整实验的：
-1.FAISS向量数据库更换为另外数据库，不同数据库有什么优缺点或者特点
-2.文档加载器还有其他的吗？如果需要图片处理怎么办？
-3.文本分割器方式，有什么优化方法
-4.经典检索问答：为啥需要问答链，还有其他的吗？
-5.加载模型时参数温度：控制输出随机性是什么意思？
-6.如果加载其他模型，同样是if else吗？
-7.向量嵌入模型有哪几类？不同的大模型有自己的向量模型吗？OpenAiEmbeddings和ZhipuEmbeddingd
-8.chain_type=stuff是什么意思？简单场景是这个？其他场景是什么？
+RAG 团队知识助手 - 完整优化版
+功能：批量文档、多文件类型、历史记忆、自定义Prompt、收藏
+性能：自动向量库检测、智能分块、缓存、混合检索（FAISS + BM25）
+架构：模块化、面向对象、支持增量更新
 """
 import os
+import json
+import asyncio
+import time
+import hashlib
+from pathlib import Path
 from dotenv import load_dotenv
+from typing import List, Dict, Optional, Any
+from dataclasses import dataclass, asdict
+from datetime import datetime
 
-# 文档加载与处理（通用）
-from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
+# 文档处理
+from langchain_community.document_loaders import (
+    PyPDFLoader, TextLoader, Docx2txtLoader,
+    UnstructuredExcelLoader, UnstructuredPowerPointLoader, UnstructuredMarkdownLoader
+)
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.retrievers import BaseRetriever
 
-# 经典链（LangChain 1.x 需要从 classic 导入）
-from langchain_classic.chains import RetrievalQA
+# 混合检索相关
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 
-# 加载 .env 文件
+# 缓存机制
+from functools import lru_cache
+
 load_dotenv()
 
-# ===================== 模型工厂函数 =====================
-def get_llm(provider: str = None, temperature: float = 0.1, **kwargs):
-    """
-    根据 provider 返回对应的 LLM 实例
-    provider: 'zhipu' 或 'openai'（默认从环境变量 LLM_PROVIDER 读取，若未设置则使用 zhipu）
-    """
-    provider = provider or os.getenv("LLM_PROVIDER", "zhipu").lower()
-    temperature = kwargs.get("temperature", temperature)
+# ===================== 全局配置 =====================
+@dataclass
+class Config:
+    DOC_DIR: str = "./team_doc"
+    VECTOR_DB_DIR: str = "faiss_team_vector_db"
+    HISTORY_FILE: str = "chat_history.json"
+    COLLECTION_FILE: str = "collection.json"
+    CACHE_DIR: str = "./cache"
+    
+    BASE_CHUNK_SIZE: int = 800
+    BASE_CHUNK_OVERLAP: int = 150
+    RETRIEVE_TOP_K: int = 5
+    ENABLE_MIXED_RETRIEVAL: bool = True   # 启用混合检索
+    TEMPERATURE: float = 0.1
+    
+    ENABLE_CACHE: bool = True
+    ENABLE_HISTORY: bool = True
+    MAX_HISTORY_LENGTH: int = 10
 
-    if provider == "openai":
-        # 延迟导入，避免未安装该包时报错
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
-            model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
-            temperature=temperature,
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL", None),
-        )
-    elif provider == "zhipu":
-        from langchain_community.chat_models import ChatZhipuAI
-        return ChatZhipuAI(
-            model=os.getenv("ZHIPU_MODEL", "glm-4"),
-            temperature=temperature,
-            api_key=os.getenv("ZHIPUAI_API_KEY"),
-            base_url=os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/"),
-        )
-    else:
-        raise ValueError(f"不支持的 LLM provider: {provider}，请在 .env 中设置 LLM_PROVIDER=zhipu 或 openai")
+config = Config()
+Path(config.CACHE_DIR).mkdir(exist_ok=True)
+Path(config.DOC_DIR).mkdir(exist_ok=True)
 
-def get_embeddings(provider: str = None):
-    """
-    根据 provider 返回对应的 Embeddings 实例
-    """
-    provider = provider or os.getenv("EMBEDDING_PROVIDER", "zhipu").lower()
+# ===================== 数据模型 =====================
+@dataclass
+class ChatMessage:
+    question: str
+    answer: str
+    sources: List[str]
+    timestamp: str = None
+    
+    def __post_init__(self):
+        if not self.timestamp:
+            self.timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    if provider == "openai":
-        from langchain_openai import OpenAIEmbeddings
-        return OpenAIEmbeddings(
-            model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
-            api_key=os.getenv("OPENAI_API_KEY"),
-            base_url=os.getenv("OPENAI_BASE_URL", None),
-        )
-    elif provider == "zhipu":
-        from langchain_community.embeddings import ZhipuAIEmbeddings
-        return ZhipuAIEmbeddings(
-            model=os.getenv("ZHIPU_EMBEDDING_MODEL", "text-embedding"),
-            api_key=os.getenv("ZHIPUAI_API_KEY"),
-            base_url=os.getenv("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4/"),
-        )
-    else:
-        raise ValueError(f"不支持的 Embedding provider: {provider}")
+# ===================== 模型工厂 =====================
+class ModelFactory:
+    @staticmethod
+    def get_llm(provider: str = None, temperature: float = config.TEMPERATURE):
+        provider = provider or os.getenv("LLM_PROVIDER", "zhipu").lower()
+        if provider == "openai":
+            from langchain_openai import ChatOpenAI
+            return ChatOpenAI(
+                model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
+                temperature=temperature,
+                api_key=os.getenv("OPENAI_API_KEY"),
+                base_url=os.getenv("OPENAI_BASE_URL"),
+            )
+        elif provider == "zhipu":
+            from langchain_community.chat_models import ChatZhipuAI
+            return ChatZhipuAI(
+                model=os.getenv("ZHIPU_MODEL", "glm-4-flash"),
+                temperature=temperature,
+                api_key=os.getenv("ZHIPUAI_API_KEY"),
+                base_url=os.getenv("ZHIPU_BASE_URL"),
+            )
+        raise ValueError(f"不支持的模型提供商: {provider}")
 
-# ===================== 文档处理函数 =====================
-def load_document(file_path: str):
-    """根据扩展名自动选择加载器"""
-    if file_path.endswith(".pdf"):
-        loader = PyPDFLoader(file_path)
-    elif file_path.endswith(".txt"):
-        loader = TextLoader(file_path, encoding="utf-8")
-    elif file_path.endswith(".docx"):
-        loader = Docx2txtLoader(file_path)
-    else:
-        raise Exception(f"不支持的文件格式: {file_path}，仅支持 .pdf / .txt / .docx")
-    return loader.load()
+    @staticmethod
+    def get_embeddings(provider: str = None):
+        provider = provider or os.getenv("EMBEDDING_PROVIDER", "zhipu").lower()
+        if provider == "openai":
+            from langchain_openai import OpenAIEmbeddings
+            return OpenAIEmbeddings(
+                model=os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-ada-002"),
+                api_key=os.getenv("OPENAI_API_KEY"),
+                base_url=os.getenv("OPENAI_BASE_URL"),
+            )
+        elif provider == "zhipu":
+            from langchain_community.embeddings import ZhipuAIEmbeddings
+            return ZhipuAIEmbeddings(
+                model=os.getenv("ZHIPU_EMBEDDING_MODEL", "embedding-2"),
+                api_key=os.getenv("ZHIPUAI_API_KEY"),
+                base_url=os.getenv("ZHIPU_BASE_URL"),
+            )
+        raise ValueError(f"不支持的向量模型提供商: {provider}")
 
-def split_documents(docs, chunk_size: int = 800, chunk_overlap: int = 150):
-    """文档分块"""
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", "。", "，", " ", ""],
-    )
-    return text_splitter.split_documents(docs)
+# ===================== FAISS 包装器（支持增量） =====================
+class DocumentAwareFAISSRetriever(BaseRetriever):
+    """为FAISS向量库增加 add_documents 方法，并统一检索接口"""
+    vector_store: FAISS
+    k: int = config.RETRIEVE_TOP_K
 
-def build_vector_store(split_docs, embeddings, persist_dir: str = "faiss_team_vector_db"):
-    """构建 FAISS 向量库并保存"""
-    vector_store = FAISS.from_documents(split_docs, embeddings)
-    vector_store.save_local(persist_dir)
-    return vector_store
+    class Config:
+        arbitrary_types_allowed = True
 
-def load_vector_store(embeddings, persist_dir: str = "faiss_team_vector_db"):
-    """加载本地的 FAISS 向量库"""
-    return FAISS.load_local(persist_dir, embeddings, allow_dangerous_deserialization=True)
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        # 同步检索实现（必须实现）
+        return self.vector_store.similarity_search(query, k=self.k)
 
-def build_rag_chain(vector_store, llm, top_k: int = 3):
-    """构建 RetrievalQA 链"""
-    retriever = vector_store.as_retriever(search_kwargs={"k": top_k})
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        return_source_documents=True,
-    )
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        # 异步检索实现（必须实现）
+        return self._get_relevant_documents(query)
 
-# ===================== 主程序 =====================
-if __name__ == "__main__":
-    # ----- 配置区 -----
-    DOC_PATH = "./team_doc/2015年系统架构师考试科目三：论文真题.pdf"   # 请修改为你的文档路径
-    CHUNK_SIZE = 800
-    CHUNK_OVERLAP = 150
-    RETRIEVE_TOP_K = 3
-    VECTOR_DB_DIR = "faiss_team_vector_db"
+    def get_relevant_documents(self, query: str) -> List[Document]:
+        return self.vector_store.similarity_search(query, k=self.k)
 
-    print("🚀 正在初始化模型...")
-    llm = get_llm()
-    embeddings = get_embeddings()
-    print(f"✅ 当前使用 LLM: {type(llm).__name__}, Embeddings: {type(embeddings).__name__}")
+    async def aget_relevant_documents(self, query: str) -> List[Document]:
+        return self.get_relevant_documents(query)
 
-    # ----- 首次运行：构建向量库 -----
-    # 如果已经构建过，可以注释掉下面三行，并取消注释 load_vector_store 那一行
-    print(f"📄 正在加载文档: {DOC_PATH}")
-    docs = load_document(DOC_PATH)
-    print(f"📑 文档加载完成，共 {len(docs)} 页/段落")
-    split_docs = split_documents(docs, CHUNK_SIZE, CHUNK_OVERLAP)
-    print(f"✂️ 文档分割完成，共 {len(split_docs)} 个文本块")
-    vector_store = build_vector_store(split_docs, embeddings, VECTOR_DB_DIR)
-    print(f"💾 向量库已保存至 {VECTOR_DB_DIR}")
+    def add_documents(self, new_docs: List[Document]) -> List[str]:
+        return self.vector_store.add_documents(new_docs)
 
-    # 后续运行时，可以直接加载已有的向量库（避免重复解析）
-    # vector_store = load_vector_store(embeddings, VECTOR_DB_DIR)
-    # print("💾 已从本地加载向量库")
-
-    # ----- 构建 RAG 问答链 -----
-    rag_chain = build_rag_chain(vector_store, llm, RETRIEVE_TOP_K)
-
-    # ----- 命令行交互 -----
-    print("\n===== 团队知识助手已启动，输入 q 退出 =====\n")
-    while True:
-        question = input("💬 请输入问题：").strip()
-        if question.lower() == "q":
-            break
-        if not question:
-            continue
+# ===================== 文档处理器 =====================
+class DocumentProcessor:
+    SUPPORTED_EXT = {
+        ".pdf": PyPDFLoader,
+        ".txt": TextLoader,
+        ".docx": Docx2txtLoader,
+        ".md": UnstructuredMarkdownLoader,
+        ".xlsx": UnstructuredExcelLoader,
+        ".pptx": UnstructuredPowerPointLoader
+    }
+    
+    @staticmethod
+    async def async_load_single_file(file_path: str) -> List[Document]:
         try:
-            result = rag_chain.invoke(question)
-            print("\n🤖 助手回答：")
-            print(result["result"])
-            print("\n📚 引用知识库原文：")
-            for idx, doc in enumerate(result["source_documents"]):
-                preview = doc.page_content[:200].replace("\n", " ")
-                print(f"【参考片段 {idx+1}】{preview}...")
-            print("-" * 60)
+            ext = Path(file_path).suffix.lower()
+            if ext not in DocumentProcessor.SUPPORTED_EXT:
+                print(f"⚠️ 跳过不支持的文件: {file_path}")
+                return []
+            loader_cls = DocumentProcessor.SUPPORTED_EXT[ext]
+            if ext == ".txt":
+                loader = loader_cls(file_path, encoding="utf-8")
+            else:
+                loader = loader_cls(file_path)
+            return loader.load()
         except Exception as e:
-            print(f"❌ 发生错误: {e}")
+            print(f"❌ 加载文件失败 {file_path}: {str(e)}")
+            return []
 
-    print("👋 已退出知识助手")
+    @staticmethod
+    async def batch_load_documents(doc_dir: str = config.DOC_DIR) -> List[Document]:
+        files = [str(f) for f in Path(doc_dir).rglob("*") if f.suffix.lower() in DocumentProcessor.SUPPORTED_EXT]
+        if not files:
+            raise Exception(f"目录 {doc_dir} 中未找到支持的文档")
+        print(f"📄 发现 {len(files)} 个支持的文档，开始异步加载...")
+        tasks = [DocumentProcessor.async_load_single_file(file) for file in files]
+        docs_list = await asyncio.gather(*tasks)
+        return [doc for sublist in docs_list for doc in sublist]
+
+    @staticmethod
+    def smart_split_documents(docs: List[Document]) -> List[Document]:
+        total_length = sum(len(doc.page_content) for doc in docs)
+        avg_length = total_length / len(docs) if docs else 0
+        if avg_length > 5000:
+            chunk_size, chunk_overlap = 1500, 300
+        elif avg_length < 1000:
+            chunk_size, chunk_overlap = 500, 100
+        else:
+            chunk_size, chunk_overlap = config.BASE_CHUNK_SIZE, config.BASE_CHUNK_OVERLAP
+        print(f"📏 智能分块参数：chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            separators=["\n\n", "\n", "。", "，", " ", ""],
+            length_function=len
+        )
+        return text_splitter.split_documents(docs)
+
+# ===================== 向量库管理器（混合检索 + 增量更新） =====================
+class VectorStoreManager:
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
+        self.corpus_path = Path(config.VECTOR_DB_DIR) / "corpus.json"
+        self.fingerprint_path = Path(config.VECTOR_DB_DIR) / "fingerprints.json"
+
+    @staticmethod
+    def _get_doc_fingerprint(doc: Document) -> str:
+        content = doc.page_content
+        meta_str = str(sorted(doc.metadata.items()))
+        return hashlib.sha256(f"{content}{meta_str}".encode()).hexdigest()
+
+    def _save_corpus_and_fingerprints(self, docs: List[Document]):
+        """保存文档原始文本和指纹，用于重建BM25"""
+        corpus = [doc.page_content for doc in docs]
+        with open(self.corpus_path, "w", encoding="utf-8") as f:
+            json.dump(corpus, f, ensure_ascii=False, indent=2)
+        fingerprints = [self._get_doc_fingerprint(doc) for doc in docs]
+        with open(self.fingerprint_path, "w") as f:
+            json.dump(fingerprints, f)
+
+    def _build_bm25_from_corpus(self) -> BM25Retriever:
+        """从保存的语料文件重建BM25检索器"""
+        with open(self.corpus_path, "r", encoding="utf-8") as f:
+            corpus_texts = json.load(f)
+        bm25 = BM25Retriever.from_texts(corpus_texts)
+        bm25.k = config.RETRIEVE_TOP_K
+        return bm25
+
+    def _find_new_documents(self, docs: List[Document]) -> List[Document]:
+        """通过指纹比对，找出新增的文档块"""
+        if not self.fingerprint_path.exists():
+            return docs
+        with open(self.fingerprint_path, "r") as f:
+            old_fps = set(json.load(f))
+        new_docs = []
+        for doc in docs:
+            if self._get_doc_fingerprint(doc) not in old_fps:
+                new_docs.append(doc)
+        return new_docs
+
+    def check_vector_db_exists(self) -> bool:
+        return (Path(config.VECTOR_DB_DIR) / "index.faiss").exists()
+
+    def _first_time_build(self, docs: List[Document]):
+        """首次构建：创建FAISS、保存语料和指纹、构建BM25"""
+        print("🔨 首次构建向量库...")
+        vs = FAISS.from_documents(docs, self.embeddings)
+        self._save_corpus_and_fingerprints(docs)
+        vs.save_local(config.VECTOR_DB_DIR)
+        bm25 = BM25Retriever.from_documents(docs)
+        bm25.k = config.RETRIEVE_TOP_K
+        return {"vs": vs, "bm25": bm25}
+
+    def build_or_load_vector_store(self, docs: List[Document] = None):
+        """
+        核心方法：构建、加载或增量更新向量库
+        返回字典: {"vs": FAISS实例, "bm25": BM25Retriever实例}
+        """
+        # ---------- 已有向量库 ----------
+        if self.check_vector_db_exists():
+            print("✅ 检测到本地向量库。")
+            # 加载 FAISS
+            vs = FAISS.load_local(
+                config.VECTOR_DB_DIR,
+                self.embeddings,
+                allow_dangerous_deserialization=True
+            )
+            
+            # 检查语料文件是否存在，若不存在则视为旧版，需要重建全量索引
+            if not self.corpus_path.exists() or not self.fingerprint_path.exists():
+                print("   ⚠️ 检测到旧版向量库（缺少语料文件），将执行全量重建。")
+                if docs is None:
+                    raise Exception("缺少语料文件且未提供文档数据，无法重建。")
+                # 直接进入首次构建逻辑
+                return self._first_time_build(docs)
+            
+            # 如果没有新文档提供，直接基于语料重建 BM25
+            if docs is None:
+                print("   无新文档，直接加载已有检索器。")
+                bm25 = self._build_bm25_from_corpus()
+                return {"vs": vs, "bm25": bm25}
+            
+            # 有新文档 → 增量更新
+            print("   检查增量文档...")
+            new_docs = self._find_new_documents(docs)
+            if new_docs:
+                print(f"   发现 {len(new_docs)} 个新文档块，开始增量添加...")
+                # 1. 增量添加到 FAISS
+                vs.add_documents(new_docs)
+                # 2. 更新语料库和指纹文件
+                with open(self.corpus_path, "r", encoding="utf-8") as f:
+                    old_corpus = json.load(f)
+                new_corpus = old_corpus + [doc.page_content for doc in new_docs]
+                with open(self.fingerprint_path, "r") as f:
+                    old_fps = json.load(f)
+                new_fps = old_fps + [self._get_doc_fingerprint(doc) for doc in new_docs]
+                with open(self.corpus_path, "w", encoding="utf-8") as f:
+                    json.dump(new_corpus, f, ensure_ascii=False, indent=2)
+                with open(self.fingerprint_path, "w") as f:
+                    json.dump(new_fps, f)
+            else:
+                print("   未发现新增文档。")
+            
+            # 重建 BM25（全量语料）
+            bm25 = self._build_bm25_from_corpus()
+            # 保存更新后的 FAISS
+            vs.save_local(config.VECTOR_DB_DIR)
+            return {"vs": vs, "bm25": bm25}
+        
+        # ---------- 首次构建 ----------
+        if docs is None:
+            raise Exception("首次构建向量库需要提供文档数据")
+        return self._first_time_build(docs)
+
+    def get_mixed_retriever(self, faiss_retriever_wrapper, bm25_retriever):
+        """返回混合检索器"""
+        if not config.ENABLE_MIXED_RETRIEVAL:
+            return faiss_retriever_wrapper
+        return EnsembleRetriever(
+            retrievers=[bm25_retriever, faiss_retriever_wrapper],
+            weights=[0.4, 0.6]
+        )
+
+# ===================== 对话管理器 =====================
+class ChatManager:
+    def __init__(self):
+        self.history: List[ChatMessage] = self._load_json(config.HISTORY_FILE, [])
+        self.collections: List[ChatMessage] = self._load_json(config.COLLECTION_FILE, [])
+        self.prompt_template = self._default_prompt()
+
+    @staticmethod
+    def _load_json(file_path: str, default: list) -> list:
+        try:
+            if Path(file_path).exists():
+                with open(file_path, "r", encoding="utf-8") as f:
+                    return [ChatMessage(**item) for item in json.load(f)]
+        except:
+            pass
+        return default
+
+    @staticmethod
+    def _save_json(file_path: str, data: List[ChatMessage]):
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump([asdict(item) for item in data], f, ensure_ascii=False, indent=2)
+
+    def save_history(self):
+        self.history = self.history[-config.MAX_HISTORY_LENGTH:]
+        self._save_json(config.HISTORY_FILE, self.history)
+
+    def save_collections(self):
+        self._save_json(config.COLLECTION_FILE, self.collections)
+
+    def add_history(self, msg: ChatMessage):
+        if config.ENABLE_HISTORY:
+            self.history.append(msg)
+            self.save_history()
+
+    def add_collection(self, msg: ChatMessage):
+        self.collections.append(msg)
+        self.save_collections()
+
+    def _default_prompt(self) -> ChatPromptTemplate:
+        return ChatPromptTemplate.from_messages([
+            ("system", "你是团队知识助手，基于提供的知识库内容回答问题，回答要准确、简洁、专业。\n知识库内容：{context}"),
+            MessagesPlaceholder(variable_name="chat_history"),
+            ("human", "{question}")
+        ])
+
+    def set_custom_prompt(self, template_str: str):
+        self.prompt_template = ChatPromptTemplate.from_template(template_str)
+
+# ===================== RAG核心链 =====================
+class RAGChain:
+    def __init__(self, retriever, llm, prompt, chat_manager: ChatManager):
+        self.retriever = retriever
+        self.llm = llm
+        self.prompt = prompt
+        self.chat_manager = chat_manager
+        self.parser = StrOutputParser()
+
+    @lru_cache(maxsize=100)
+    def _cached_retrieve(self, question: str) -> str:
+        #docs = self.retriever.get_relevant_documents(question)
+        docs = self.retriever.invoke(question)
+        return "\n\n".join([doc.page_content for doc in docs])
+
+    def _format_chat_history(self) -> List:
+        from langchain_core.messages import HumanMessage, AIMessage
+        messages = []
+        for msg in self.chat_manager.history[-5:]:
+            messages.append(HumanMessage(content=msg.question))
+            messages.append(AIMessage(content=msg.answer))
+        return messages
+
+    def ask(self, question: str) -> ChatMessage:
+        if config.ENABLE_CACHE:
+            context = self._cached_retrieve(question)
+        else:
+            docs = self.retriever.get_relevant_documents(question)
+            context = "\n\n".join([doc.page_content for doc in docs])
+        
+        chain = self.prompt | self.llm | self.parser
+        answer = chain.invoke({
+            "context": context,
+            "question": question,
+            "chat_history": self._format_chat_history()
+        })
+        sources = context.split("\n\n")[:3]
+        msg = ChatMessage(question=question, answer=answer, sources=sources)
+        self.chat_manager.add_history(msg)
+        return msg
+
+# ===================== 主应用 =====================
+class RAGAssistant:
+    def __init__(self):
+        print("🚀 初始化RAG团队知识助手...")
+        self.llm = ModelFactory.get_llm()
+        self.embeddings = ModelFactory.get_embeddings()
+        self.chat_manager = ChatManager()
+        self.vector_manager = VectorStoreManager(self.embeddings)
+        self.rag_chain = None
+
+    async def initialize(self):
+        # 1. 加载文档
+        docs = await DocumentProcessor.batch_load_documents()
+        print(f"✅ 原始文档加载完成，共 {len(docs)} 个文档片段")
+        
+        # 2. 智能分块
+        split_docs = DocumentProcessor.smart_split_documents(docs)
+        print(f"✂️ 文档分块完成，共 {len(split_docs)} 个文本块")
+        
+        # 3. 构建或加载向量库（返回包含FAISS和BM25的字典）
+        components = self.vector_manager.build_or_load_vector_store(split_docs)
+        faiss_vs = components["vs"]
+        bm25 = components["bm25"]
+        
+        # 4. 包装FAISS检索器（使其支持 add_documents 方法）
+        faiss_retriever = DocumentAwareFAISSRetriever(vector_store=faiss_vs, k=config.RETRIEVE_TOP_K)
+        
+        # 5. 获得最终检索器（混合或单一）
+        retriever = self.vector_manager.get_mixed_retriever(faiss_retriever, bm25)
+        
+        # 6. 构建RAG链
+        self.rag_chain = RAGChain(
+            retriever=retriever,
+            llm=self.llm,
+            prompt=self.chat_manager.prompt_template,
+            chat_manager=self.chat_manager
+        )
+        print("✅ RAG助手初始化完成！")
+
+    def show_help(self):
+        print("""
+📚 命令帮助：
+q / quit    - 退出程序
+help        - 显示帮助
+collect     - 收藏上一轮对话
+prompt      - 自定义Prompt模版
+history     - 查看历史对话
+clear       - 清空历史对话
+""")
+
+    async def run(self):
+        await self.initialize()
+        last_msg = None
+        print("\n===== 🤖 团队知识助手已启动 =====")
+        self.show_help()
+        while True:
+            query = input("\n💬 请输入问题/命令：").strip()
+            if not query:
+                continue
+            if query.lower() in ["q", "quit"]:
+                print("👋 再见！")
+                break
+            elif query.lower() == "help":
+                self.show_help()
+                continue
+            elif query.lower() == "history":
+                print(f"\n📜 历史对话（最近{len(self.chat_manager.history)}条）：")
+                for i, msg in enumerate(self.chat_manager.history[-5:]):
+                    print(f"{i+1}. Q: {msg.question}")
+                continue
+            elif query.lower() == "clear":
+                self.chat_manager.history = []
+                self.chat_manager.save_history()
+                print("✅ 历史对话已清空")
+                continue
+            elif query.lower() == "collect" and last_msg:
+                self.chat_manager.add_collection(last_msg)
+                continue
+            elif query.lower() == "prompt":
+                print("\n✏️ 请输入自定义Prompt模版（输入end结束）：")
+                lines = []
+                while True:
+                    line = input()
+                    if line == "end":
+                        break
+                    lines.append(line)
+                custom_template = "\n".join(lines)
+                self.chat_manager.set_custom_prompt(custom_template)
+                if self.rag_chain:
+                    self.rag_chain.prompt = self.chat_manager.prompt_template
+                continue
+
+            try:
+                start = time.time()
+                msg = self.rag_chain.ask(query)
+                last_msg = msg
+                print(f"\n🤖 回答（耗时{time.time()-start:.2f}s）：")
+                print(msg.answer)
+                print("\n📚 参考来源：")
+                for i, src in enumerate(msg.sources):
+                    content = src[:200].replace("\n", " ")
+                    print(f"【来源{i+1}】{content}...")
+            except Exception as e:
+                print(f"❌ 出错：{str(e)}")
+
+if __name__ == "__main__":
+    try:
+        assistant = RAGAssistant()
+        asyncio.run(assistant.run())
+    except Exception as e:
+        print(f"💥 系统异常：{str(e)}")
