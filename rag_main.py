@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 RAG 团队知识助手 - 完整优化版
-功能：批量文档、多文件类型、历史记忆、自定义Prompt、收藏
-性能：自动向量库检测、智能分块、缓存、混合检索（FAISS + BM25）
+功能：批量文档、多文件类型、历史记忆、自定义Prompt、收藏、噪音清洗
+性能：自动检测文件变化，新增文件增量添加，修改/删除触发全量重建
 架构：模块化、面向对象、支持增量更新
 """
 import os
@@ -11,6 +11,7 @@ import json
 import asyncio
 import time
 import hashlib
+import re
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import List, Dict, Optional, Any
@@ -27,7 +28,6 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 from langchain_core.retrievers import BaseRetriever
 
 # 混合检索相关
@@ -47,11 +47,12 @@ class Config:
     HISTORY_FILE: str = "chat_history.json"
     COLLECTION_FILE: str = "collection.json"
     CACHE_DIR: str = "./cache"
+    FILE_META_FILE: str = "file_metadata.json"
     
     BASE_CHUNK_SIZE: int = 800
     BASE_CHUNK_OVERLAP: int = 150
     RETRIEVE_TOP_K: int = 5
-    ENABLE_MIXED_RETRIEVAL: bool = True   # 启用混合检索
+    ENABLE_MIXED_RETRIEVAL: bool = True
     TEMPERATURE: float = 0.1
     
     ENABLE_CACHE: bool = True
@@ -126,21 +127,42 @@ class DocumentAwareFAISSRetriever(BaseRetriever):
         arbitrary_types_allowed = True
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
-        # 同步检索实现（必须实现）
         return self.vector_store.similarity_search(query, k=self.k)
 
     async def _aget_relevant_documents(self, query: str) -> List[Document]:
-        # 异步检索实现（必须实现）
         return self._get_relevant_documents(query)
 
     def get_relevant_documents(self, query: str) -> List[Document]:
-        return self.vector_store.similarity_search(query, k=self.k)
+        return self._get_relevant_documents(query)
 
     async def aget_relevant_documents(self, query: str) -> List[Document]:
-        return self.get_relevant_documents(query)
+        return await self._aget_relevant_documents(query)
 
     def add_documents(self, new_docs: List[Document]) -> List[str]:
         return self.vector_store.add_documents(new_docs)
+
+# ===================== 噪音清洗工具 =====================
+class TextCleaner:
+    @staticmethod
+    def clean(text: str) -> str:
+        """清洗文本：移除QQ群、URL、多余空行、水印等"""
+        # 移除 QQ 群相关行
+        text = re.sub(r'(?i)^.*QQ[：:]\s*[\d\s]+.*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'(?i)^.*QQ.*群.*$', '', text, flags=re.MULTILINE)
+        # 移除 URL
+        text = re.sub(r'https?://\S+|www\.\S+', '', text)
+        # 移除水印
+        text = re.sub(r'(?i)^.*Evaluation Warning.*$', '', text, flags=re.MULTILINE)
+        text = re.sub(r'(?i)^.*Spire\.PDF.*$', '', text, flags=re.MULTILINE)
+        # 移除页码
+        text = re.sub(r'第\s*\d+\s*页\s*共\s*\d+\s*页', '', text)
+        # 移除单独的数字行
+        text = re.sub(r'^\s*\d+\s*$', '', text, flags=re.MULTILINE)
+        # 合并多余空行
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        # 去除每行首尾空白，再重组
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        return '\n'.join(lines)
 
 # ===================== 文档处理器 =====================
 class DocumentProcessor:
@@ -165,18 +187,20 @@ class DocumentProcessor:
                 loader = loader_cls(file_path, encoding="utf-8")
             else:
                 loader = loader_cls(file_path)
-            return loader.load()
+            docs = loader.load()
+            for doc in docs:
+                doc.page_content = TextCleaner.clean(doc.page_content)
+            return docs
         except Exception as e:
             print(f"❌ 加载文件失败 {file_path}: {str(e)}")
             return []
 
     @staticmethod
-    async def batch_load_documents(doc_dir: str = config.DOC_DIR) -> List[Document]:
-        files = [str(f) for f in Path(doc_dir).rglob("*") if f.suffix.lower() in DocumentProcessor.SUPPORTED_EXT]
-        if not files:
-            raise Exception(f"目录 {doc_dir} 中未找到支持的文档")
-        print(f"📄 发现 {len(files)} 个支持的文档，开始异步加载...")
-        tasks = [DocumentProcessor.async_load_single_file(file) for file in files]
+    async def batch_load_documents(file_paths: List[str]) -> List[Document]:
+        if not file_paths:
+            return []
+        print(f"📄 加载 {len(file_paths)} 个文档...")
+        tasks = [DocumentProcessor.async_load_single_file(p) for p in file_paths]
         docs_list = await asyncio.gather(*tasks)
         return [doc for sublist in docs_list for doc in sublist]
 
@@ -199,13 +223,64 @@ class DocumentProcessor:
         )
         return text_splitter.split_documents(docs)
 
-# ===================== 向量库管理器（混合检索 + 增量更新） =====================
+# ===================== 向量库管理器（文件级变更追踪 + 增量新增/全量重建） =====================
 class VectorStoreManager:
     def __init__(self, embeddings):
         self.embeddings = embeddings
-        self.corpus_path = Path(config.VECTOR_DB_DIR) / "corpus.json"
-        self.fingerprint_path = Path(config.VECTOR_DB_DIR) / "fingerprints.json"
+        self.vector_db_path = Path(config.VECTOR_DB_DIR).absolute()
+        self.file_meta_path = self.vector_db_path / config.FILE_META_FILE
+        self.corpus_path = self.vector_db_path / "corpus.json"
+        self.fingerprint_path = self.vector_db_path / "fingerprints.json"
+        self.vector_db_path.mkdir(exist_ok=True)
+        self.doc_dir = Path(config.DOC_DIR).absolute()
+        self.doc_dir.mkdir(exist_ok=True)
 
+    # ---------- 文件级元数据管理 ----------
+    def _get_file_metadata(self, file_path: Path) -> dict:
+        stat = file_path.stat()
+        return {"mtime": stat.st_mtime, "size": stat.st_size}
+
+    def _get_rel_path(self, abs_path: Path) -> str:
+        return str(abs_path.relative_to(self.doc_dir))
+
+    def _scan_directory_files(self) -> List[Path]:
+        all_files = []
+        for p in self.doc_dir.rglob("*"):
+            if p.suffix.lower() in DocumentProcessor.SUPPORTED_EXT:
+                all_files.append(p.absolute())
+        return all_files
+
+    def _scan_directory_metadata(self) -> dict:
+        meta = {}
+        for abs_path in self._scan_directory_files():
+            rel_path = self._get_rel_path(abs_path)
+            meta[rel_path] = self._get_file_metadata(abs_path)
+        return meta
+
+    def _load_old_metadata(self) -> dict:
+        if not self.file_meta_path.exists():
+            return {}
+        with open(self.file_meta_path, "r") as f:
+            return json.load(f)
+
+    def _save_metadata(self, meta: dict):
+        with open(self.file_meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+    def _detect_changes(self) -> tuple:
+        old_meta = self._load_old_metadata()
+        new_meta = self._scan_directory_metadata()
+        old_paths = set(old_meta.keys())
+        new_paths = set(new_meta.keys())
+        added = new_paths - old_paths
+        deleted = old_paths - new_paths
+        modified = set()
+        for path in old_paths & new_paths:
+            if old_meta[path] != new_meta[path]:
+                modified.add(path)
+        return list(added), list(modified), list(deleted)
+
+    # ---------- 指纹工具 ----------
     @staticmethod
     def _get_doc_fingerprint(doc: Document) -> str:
         content = doc.page_content
@@ -213,7 +288,6 @@ class VectorStoreManager:
         return hashlib.sha256(f"{content}{meta_str}".encode()).hexdigest()
 
     def _save_corpus_and_fingerprints(self, docs: List[Document]):
-        """保存文档原始文本和指纹，用于重建BM25"""
         corpus = [doc.page_content for doc in docs]
         with open(self.corpus_path, "w", encoding="utf-8") as f:
             json.dump(corpus, f, ensure_ascii=False, indent=2)
@@ -222,101 +296,96 @@ class VectorStoreManager:
             json.dump(fingerprints, f)
 
     def _build_bm25_from_corpus(self) -> BM25Retriever:
-        """从保存的语料文件重建BM25检索器"""
         with open(self.corpus_path, "r", encoding="utf-8") as f:
             corpus_texts = json.load(f)
         bm25 = BM25Retriever.from_texts(corpus_texts)
         bm25.k = config.RETRIEVE_TOP_K
         return bm25
 
-    def _find_new_documents(self, docs: List[Document]) -> List[Document]:
-        """通过指纹比对，找出新增的文档块"""
-        if not self.fingerprint_path.exists():
-            return docs
-        with open(self.fingerprint_path, "r") as f:
-            old_fps = set(json.load(f))
-        new_docs = []
-        for doc in docs:
-            if self._get_doc_fingerprint(doc) not in old_fps:
-                new_docs.append(doc)
-        return new_docs
-
     def check_vector_db_exists(self) -> bool:
-        return (Path(config.VECTOR_DB_DIR) / "index.faiss").exists()
+        return (self.vector_db_path / "index.faiss").exists()
 
-    def _first_time_build(self, docs: List[Document]):
-        """首次构建：创建FAISS、保存语料和指纹、构建BM25"""
-        print("🔨 首次构建向量库...")
-        vs = FAISS.from_documents(docs, self.embeddings)
-        self._save_corpus_and_fingerprints(docs)
-        vs.save_local(config.VECTOR_DB_DIR)
-        bm25 = BM25Retriever.from_documents(docs)
-        bm25.k = config.RETRIEVE_TOP_K
+    # ---------- 全量重建 ----------
+    async def full_rebuild(self) -> dict:
+        print("🔄 全量重建向量库...")
+        all_files = self._scan_directory_files()
+        if not all_files:
+            raise Exception(f"目录 {self.doc_dir} 中未找到支持的文档")
+        docs = await DocumentProcessor.batch_load_documents([str(p) for p in all_files])
+        if not docs:
+            raise Exception("加载文档后内容为空，请检查文件格式")
+        split_docs = DocumentProcessor.smart_split_documents(docs)
+        print(f"🔨 构建 FAISS 索引（共 {len(split_docs)} 个文本块）...")
+        vs = FAISS.from_documents(split_docs, self.embeddings)
+        vs.save_local(str(self.vector_db_path))
+        self._save_corpus_and_fingerprints(split_docs)
+        bm25 = self._build_bm25_from_corpus()
+        current_meta = self._scan_directory_metadata()
+        self._save_metadata(current_meta)
+        print("✅ 全量重建完成")
         return {"vs": vs, "bm25": bm25}
 
-    def build_or_load_vector_store(self, docs: List[Document] = None):
-        """
-        核心方法：构建、加载或增量更新向量库
-        返回字典: {"vs": FAISS实例, "bm25": BM25Retriever实例}
-        """
-        # ---------- 已有向量库 ----------
-        if self.check_vector_db_exists():
-            print("✅ 检测到本地向量库。")
-            # 加载 FAISS
-            vs = FAISS.load_local(
-                config.VECTOR_DB_DIR,
-                self.embeddings,
-                allow_dangerous_deserialization=True
-            )
-            
-            # 检查语料文件是否存在，若不存在则视为旧版，需要重建全量索引
-            if not self.corpus_path.exists() or not self.fingerprint_path.exists():
-                print("   ⚠️ 检测到旧版向量库（缺少语料文件），将执行全量重建。")
-                if docs is None:
-                    raise Exception("缺少语料文件且未提供文档数据，无法重建。")
-                # 直接进入首次构建逻辑
-                return self._first_time_build(docs)
-            
-            # 如果没有新文档提供，直接基于语料重建 BM25
-            if docs is None:
-                print("   无新文档，直接加载已有检索器。")
-                bm25 = self._build_bm25_from_corpus()
-                return {"vs": vs, "bm25": bm25}
-            
-            # 有新文档 → 增量更新
-            print("   检查增量文档...")
-            new_docs = self._find_new_documents(docs)
-            if new_docs:
-                print(f"   发现 {len(new_docs)} 个新文档块，开始增量添加...")
-                # 1. 增量添加到 FAISS
-                vs.add_documents(new_docs)
-                # 2. 更新语料库和指纹文件
-                with open(self.corpus_path, "r", encoding="utf-8") as f:
-                    old_corpus = json.load(f)
-                new_corpus = old_corpus + [doc.page_content for doc in new_docs]
-                with open(self.fingerprint_path, "r") as f:
-                    old_fps = json.load(f)
-                new_fps = old_fps + [self._get_doc_fingerprint(doc) for doc in new_docs]
-                with open(self.corpus_path, "w", encoding="utf-8") as f:
-                    json.dump(new_corpus, f, ensure_ascii=False, indent=2)
-                with open(self.fingerprint_path, "w") as f:
-                    json.dump(new_fps, f)
-            else:
-                print("   未发现新增文档。")
-            
-            # 重建 BM25（全量语料）
-            bm25 = self._build_bm25_from_corpus()
-            # 保存更新后的 FAISS
-            vs.save_local(config.VECTOR_DB_DIR)
-            return {"vs": vs, "bm25": bm25}
+    # ---------- 增量添加 ----------
+    async def incremental_add(self, added_rel_paths: List[str]) -> dict:
+        print(f"📎 发现 {len(added_rel_paths)} 个新增文件，执行增量添加...")
+        added_abs_paths = [str(self.doc_dir / rel_path) for rel_path in added_rel_paths]
+        new_docs = await DocumentProcessor.batch_load_documents(added_abs_paths)
+        if not new_docs:
+            print("⚠️ 新增文件无有效内容，跳过")
+            return None
+        split_new = DocumentProcessor.smart_split_documents(new_docs)
+        if not split_new:
+            print("⚠️ 新增文件分块后为空，跳过")
+            return None
         
-        # ---------- 首次构建 ----------
-        if docs is None:
-            raise Exception("首次构建向量库需要提供文档数据")
-        return self._first_time_build(docs)
+        vs = FAISS.load_local(str(self.vector_db_path), self.embeddings, allow_dangerous_deserialization=True)
+        vs.add_documents(split_new)
+        vs.save_local(str(self.vector_db_path))
+        
+        old_corpus = []
+        if self.corpus_path.exists():
+            with open(self.corpus_path, "r", encoding="utf-8") as f:
+                old_corpus = json.load(f)
+        new_corpus = old_corpus + [doc.page_content for doc in split_new]
+        with open(self.corpus_path, "w", encoding="utf-8") as f:
+            json.dump(new_corpus, f, ensure_ascii=False, indent=2)
+        
+        old_fps = []
+        if self.fingerprint_path.exists():
+            with open(self.fingerprint_path, "r") as f:
+                old_fps = json.load(f)
+        new_fps = old_fps + [self._get_doc_fingerprint(doc) for doc in split_new]
+        with open(self.fingerprint_path, "w") as f:
+            json.dump(new_fps, f)
+        
+        bm25 = self._build_bm25_from_corpus()
+        
+        old_meta = self._load_old_metadata()
+        for rel_path in added_rel_paths:
+            abs_path = self.doc_dir / rel_path
+            old_meta[rel_path] = self._get_file_metadata(abs_path)
+        self._save_metadata(old_meta)
+        
+        print(f"✅ 增量添加完成，新增 {len(split_new)} 个文本块")
+        return {"vs": vs, "bm25": bm25}
+
+    # ---------- 主入口 ----------
+    async def build_or_load_vector_store(self):
+        if not self.check_vector_db_exists():
+            return await self.full_rebuild()
+        added, modified, deleted = self._detect_changes()
+        if modified or deleted:
+            print(f"⚠️ 检测到 {len(modified)} 个文件修改，{len(deleted)} 个文件删除，将执行全量重建。")
+            return await self.full_rebuild()
+        elif added:
+            return await self.incremental_add(added)
+        else:
+            print("✅ 文件无任何变化，直接加载现有向量库。")
+            vs = FAISS.load_local(str(self.vector_db_path), self.embeddings, allow_dangerous_deserialization=True)
+            bm25 = self._build_bm25_from_corpus()
+            return {"vs": vs, "bm25": bm25}
 
     def get_mixed_retriever(self, faiss_retriever_wrapper, bm25_retriever):
-        """返回混合检索器"""
         if not config.ENABLE_MIXED_RETRIEVAL:
             return faiss_retriever_wrapper
         return EnsembleRetriever(
@@ -383,7 +452,6 @@ class RAGChain:
 
     @lru_cache(maxsize=100)
     def _cached_retrieve(self, question: str) -> str:
-        #docs = self.retriever.get_relevant_documents(question)
         docs = self.retriever.invoke(question)
         return "\n\n".join([doc.page_content for doc in docs])
 
@@ -399,7 +467,7 @@ class RAGChain:
         if config.ENABLE_CACHE:
             context = self._cached_retrieve(question)
         else:
-            docs = self.retriever.get_relevant_documents(question)
+            docs = self.retriever.invoke(question)
             context = "\n\n".join([doc.page_content for doc in docs])
         
         chain = self.prompt | self.llm | self.parser
@@ -424,26 +492,13 @@ class RAGAssistant:
         self.rag_chain = None
 
     async def initialize(self):
-        # 1. 加载文档
-        docs = await DocumentProcessor.batch_load_documents()
-        print(f"✅ 原始文档加载完成，共 {len(docs)} 个文档片段")
-        
-        # 2. 智能分块
-        split_docs = DocumentProcessor.smart_split_documents(docs)
-        print(f"✂️ 文档分块完成，共 {len(split_docs)} 个文本块")
-        
-        # 3. 构建或加载向量库（返回包含FAISS和BM25的字典）
-        components = self.vector_manager.build_or_load_vector_store(split_docs)
+        components = await self.vector_manager.build_or_load_vector_store()
         faiss_vs = components["vs"]
         bm25 = components["bm25"]
         
-        # 4. 包装FAISS检索器（使其支持 add_documents 方法）
         faiss_retriever = DocumentAwareFAISSRetriever(vector_store=faiss_vs, k=config.RETRIEVE_TOP_K)
-        
-        # 5. 获得最终检索器（混合或单一）
         retriever = self.vector_manager.get_mixed_retriever(faiss_retriever, bm25)
         
-        # 6. 构建RAG链
         self.rag_chain = RAGChain(
             retriever=retriever,
             llm=self.llm,
