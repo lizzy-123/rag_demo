@@ -5,6 +5,7 @@ RAG 团队知识助手 - 完整优化版
 功能：批量文档、多文件类型、历史记忆、自定义Prompt、收藏、噪音清洗
 性能：自动检测文件变化，新增文件增量添加，修改/删除触发全量重建
 架构：模块化、面向对象、支持增量更新
+修复：智谱 Embedding API 64 条限制（自动分批）
 """
 import os
 import json
@@ -38,6 +39,31 @@ from langchain_community.retrievers import BM25Retriever
 from functools import lru_cache
 
 load_dotenv()
+
+# ===================== 智谱 Embedding 分批包装（解决 64 条限制） =====================
+from langchain_community.embeddings.zhipuai import ZhipuAIEmbeddings as _ZhipuAIEmbeddings
+
+class BatchedZhipuAIEmbeddings(_ZhipuAIEmbeddings):
+    """自动分批调用智谱 Embedding API，避免单次超过 64 条"""
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        batch_size = 64
+        all_embeddings = []
+        total = len(texts)
+        print(f"🚀 批量嵌入: 总数={total}, 将分 {(total + batch_size - 1) // batch_size} 批")
+        for i in range(0, total, batch_size):
+            batch = texts[i:i+batch_size]
+            print(f"   批次 {i//batch_size + 1}: {len(batch)} 条")
+            all_embeddings.extend(super().embed_documents(batch))
+        return all_embeddings
+
+    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
+        batch_size = 64
+        all_embeddings = []
+        total = len(texts)
+        for i in range(0, total, batch_size):
+            batch = texts[i:i+batch_size]
+            all_embeddings.extend(await super().aembed_documents(batch))
+        return all_embeddings
 
 # ===================== 全局配置 =====================
 @dataclass
@@ -79,8 +105,16 @@ class ChatMessage:
 class ModelFactory:
     @staticmethod
     def get_llm(provider: str = None, temperature: float = config.TEMPERATURE):
-        provider = provider or os.getenv("LLM_PROVIDER", "zhipu").lower()
-        if provider == "openai":
+        provider = provider or os.getenv("LLM_PROVIDER", "dashscope").lower()
+        if provider =="dashscope":
+            from langchain_community.llms import Tongyi
+            from langchain_community.chat_models import ChatTongyi
+            return ChatTongyi(
+                model = os.getenv("DASHSCOPE_MODE","qwen-plus-2025-07-28"),
+                temperature = temperature,
+                dashscope_api_key = os.getenv("DASHSCOPE_API_KEY"),
+            )
+        elif provider == "openai":
             from langchain_openai import ChatOpenAI
             return ChatOpenAI(
                 model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
@@ -100,7 +134,7 @@ class ModelFactory:
 
     @staticmethod
     def get_embeddings(provider: str = None):
-        provider = provider or os.getenv("EMBEDDING_PROVIDER", "zhipu").lower()
+        provider = provider or os.getenv("EMBEDDING_PROVIDER", "dashscope").lower()
         if provider == "openai":
             from langchain_openai import OpenAIEmbeddings
             return OpenAIEmbeddings(
@@ -109,11 +143,17 @@ class ModelFactory:
                 base_url=os.getenv("OPENAI_BASE_URL"),
             )
         elif provider == "zhipu":
-            from langchain_community.embeddings import ZhipuAIEmbeddings
-            return ZhipuAIEmbeddings(
+            # 关键：使用分批包装类
+            return BatchedZhipuAIEmbeddings(
                 model=os.getenv("ZHIPU_EMBEDDING_MODEL", "embedding-2"),
                 api_key=os.getenv("ZHIPUAI_API_KEY"),
                 base_url=os.getenv("ZHIPU_BASE_URL"),
+            )
+        elif provider =="dashscope":
+            from langchain_community.embeddings import DashScopeEmbeddings
+            return DashScopeEmbeddings(
+                model = os.getenv("DASHSCOPE_EMBEDDING_MODEL","text-embedding-v1"),
+                dashscope_api_key = os.getenv("DASHSCOPE_API_KEY"),
             )
         raise ValueError(f"不支持的向量模型提供商: {provider}")
 
@@ -174,7 +214,7 @@ class DocumentProcessor:
         ".xlsx": UnstructuredExcelLoader,
         ".pptx": UnstructuredPowerPointLoader
     }
-    
+
     @staticmethod
     async def async_load_single_file(file_path: str) -> List[Document]:
         try:
@@ -183,11 +223,34 @@ class DocumentProcessor:
                 print(f"⚠️ 跳过不支持的文件: {file_path}")
                 return []
             loader_cls = DocumentProcessor.SUPPORTED_EXT[ext]
+            docs = []
             if ext == ".txt":
-                loader = loader_cls(file_path, encoding="utf-8")
+                # 尝试多种编码，最后使用 chardet 自动检测
+                encodings_to_try = ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'gbk', 'gb18030']
+                loaded = False
+                for enc in encodings_to_try:
+                    try:
+                        loader = loader_cls(file_path, encoding=enc)
+                        docs = loader.load()
+                        loaded = True
+                        break
+                    except (UnicodeDecodeError, LookupError):
+                        continue
+                if not loaded:
+                    try:
+                        import chardet
+                        with open(file_path, 'rb') as f:
+                            raw = f.read()
+                            detected = chardet.detect(raw)
+                            encoding = detected.get('encoding', 'utf-8')
+                            loader = loader_cls(file_path, encoding=encoding)
+                            docs = loader.load()
+                    except ImportError:
+                        raise Exception(f"无法解码 TXT 文件 {file_path}，已尝试编码: {encodings_to_try}")
             else:
                 loader = loader_cls(file_path)
-            docs = loader.load()
+                docs = loader.load()
+            
             for doc in docs:
                 doc.page_content = TextCleaner.clean(doc.page_content)
             return docs
@@ -206,6 +269,8 @@ class DocumentProcessor:
 
     @staticmethod
     def smart_split_documents(docs: List[Document]) -> List[Document]:
+        if not docs:
+            return []
         total_length = sum(len(doc.page_content) for doc in docs)
         avg_length = total_length / len(docs) if docs else 0
         if avg_length > 5000:
