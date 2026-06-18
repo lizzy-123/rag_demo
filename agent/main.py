@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from concurrent.futures import ThreadPoolExecutor  # 并行核心
 from .graph import build_agent_graph
 
-logging.basicConfig(level=logging.INFO, format="%(asc'itime)s | %(levelname)s | %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 load_dotenv()
 
 # ======================
@@ -46,4 +46,5 @@ def run_batch_agents():
 # 主入口
 # ======================
 if __name__ == "__main__":
-    run_batch_agents()  # 并行启动 12 个任务
+    #run_batch_agents()  # 并行启动 12 个任务
+    run_single_agent("单次分析任务")

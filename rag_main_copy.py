@@ -1,12 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-RAG 团队知识助手 - 完整优化版 + 评测数据记录
+RAG 团队知识助手 - 完整优化版
 功能：批量文档、多文件类型、历史记忆、自定义Prompt、收藏、噪音清洗
 性能：自动检测文件变化，新增文件增量添加，修改/删除触发全量重建
 架构：模块化、面向对象、支持增量更新
-修复：智谱 Embedding API 64 条限制（自动分批）
-新增：分块记录、配置快照、问答记录（用于评估）
 """
 import os
 import json
@@ -14,12 +12,10 @@ import asyncio
 import time
 import hashlib
 import re
-import uuid
-import tiktoken
 from pathlib import Path
 from dotenv import load_dotenv
 from typing import List, Dict, Optional, Any
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from datetime import datetime
 
 # 文档处理
@@ -43,31 +39,6 @@ from functools import lru_cache
 
 load_dotenv()
 
-# ===================== 智谱 Embedding 分批包装（解决 64 条限制） =====================
-from langchain_community.embeddings.zhipuai import ZhipuAIEmbeddings as _ZhipuAIEmbeddings
-
-class BatchedZhipuAIEmbeddings(_ZhipuAIEmbeddings):
-    """自动分批调用智谱 Embedding API，避免单次超过 64 条"""
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        batch_size = 64
-        all_embeddings = []
-        total = len(texts)
-        print(f"🚀 批量嵌入: 总数={total}, 将分 {(total + batch_size - 1) // batch_size} 批")
-        for i in range(0, total, batch_size):
-            batch = texts[i:i+batch_size]
-            print(f"   批次 {i//batch_size + 1}: {len(batch)} 条")
-            all_embeddings.extend(super().embed_documents(batch))
-        return all_embeddings
-
-    async def aembed_documents(self, texts: List[str]) -> List[List[float]]:
-        batch_size = 64
-        all_embeddings = []
-        total = len(texts)
-        for i in range(0, total, batch_size):
-            batch = texts[i:i+batch_size]
-            all_embeddings.extend(await super().aembed_documents(batch))
-        return all_embeddings
-
 # ===================== 全局配置 =====================
 @dataclass
 class Config:
@@ -78,87 +49,19 @@ class Config:
     CACHE_DIR: str = "./cache"
     FILE_META_FILE: str = "file_metadata.json"
     
-    BASE_CHUNK_SIZE: int = 800
+    BASE_CHUNK_SIZE: int = 5000
     BASE_CHUNK_OVERLAP: int = 150
-    RETRIEVE_TOP_K: int = 3
-    RECALA_TOP_K:int = 10
-    FINAL_TOP_K:int = 3
+    RETRIEVE_TOP_K: int = 5
     ENABLE_MIXED_RETRIEVAL: bool = True
     TEMPERATURE: float = 0.1
     
-    ENABLE_CACHE: bool = False
+    ENABLE_CACHE: bool = True
     ENABLE_HISTORY: bool = True
-    MAX_HISTORY_LENGTH: int = 50
+    MAX_HISTORY_LENGTH: int = 10
 
 config = Config()
 Path(config.CACHE_DIR).mkdir(exist_ok=True)
 Path(config.DOC_DIR).mkdir(exist_ok=True)
-
-# 创建 evaluation 目录
-EVAL_DIR = Path("./evaluation")
-EVAL_DIR.mkdir(exist_ok=True)
-
-# ===================== 辅助函数：获取配置哈希和快照 ID =====================
-def get_current_config_dict(total_chunks: int = None) -> dict:
-    """获取当前配置的字典表示（用于快照）"""
-    return {
-        "embedding_provider": os.getenv("EMBEDDING_PROVIDER", "zhipu"),
-        "embedding_model": os.getenv("ZHIPU_EMBEDDING_MODEL", "embedding-2"),
-        "llm_provider": os.getenv("LLM_PROVIDER", "dashscope"),
-        "llm_model": os.getenv("DASHSCOPE_MODEL", "qwen-plus"),
-        "chunk_size": config.BASE_CHUNK_SIZE,
-        "chunk_overlap": config.BASE_CHUNK_OVERLAP,
-        "retrieve_top_k": config.RETRIEVE_TOP_K,
-        "enable_mixed_retrieval": config.ENABLE_MIXED_RETRIEVAL,
-        "mixed_weights": [0.4, 0.6],
-        "temperature": config.TEMPERATURE,
-        "enable_cache": config.ENABLE_CACHE,
-        "max_history_length": config.MAX_HISTORY_LENGTH,
-        "total_chunks": total_chunks,
-        "vector_db_path": config.VECTOR_DB_DIR,
-        "doc_dir": config.DOC_DIR,
-    }
-
-def get_config_signature(config_dict: dict) -> str:
-    """计算配置签名（忽略 total_chunks 和无关字段）"""
-    # 复制一份，去掉可能变化但不影响签名的字段
-    sig_dict = {k: v for k, v in config_dict.items() if k not in ["total_chunks", "timestamp", "snapshot_id"]}
-    return hashlib.md5(json.dumps(sig_dict, sort_keys=True).encode()).hexdigest()
-
-def record_config_snapshot(total_chunks: int) -> int:
-    """记录配置快照，返回 snapshot_id"""
-    config_dict = get_current_config_dict(total_chunks)
-    signature = get_config_signature(config_dict)
-    
-    snapshots_file = EVAL_DIR / "config_snapshots.json"
-    snapshots = []
-    if snapshots_file.exists():
-        with open(snapshots_file, "r", encoding="utf-8") as f:
-            snapshots = json.load(f)
-    
-    # 检查最后一条记录的签名是否相同
-    if snapshots:
-        last = snapshots[-1]
-        last_sig = get_config_signature({k: v for k, v in last.items() if k not in ["total_chunks", "timestamp", "snapshot_id"]})
-        if last_sig == signature:
-            # 配置未变化，但可能 total_chunks 不同，更新最后一条的 total_chunks 并返回原 id
-            if last.get("total_chunks") != total_chunks:
-                last["total_chunks"] = total_chunks
-                with open(snapshots_file, "w", encoding="utf-8") as f:
-                    json.dump(snapshots, f, indent=2, ensure_ascii=False)
-            return last["snapshot_id"]
-    
-    # 新快照
-    new_id = (snapshots[-1]["snapshot_id"] + 1) if snapshots else 1
-    new_snapshot = {
-        "snapshot_id": new_id,
-        "timestamp": datetime.now().isoformat(),
-        **config_dict
-    }
-    snapshots.append(new_snapshot)
-    with open(snapshots_file, "w", encoding="utf-8") as f:
-        json.dump(snapshots, f, indent=2, ensure_ascii=False)
-    return new_id
 
 # ===================== 数据模型 =====================
 @dataclass
@@ -176,16 +79,8 @@ class ChatMessage:
 class ModelFactory:
     @staticmethod
     def get_llm(provider: str = None, temperature: float = config.TEMPERATURE):
-        provider = provider or os.getenv("LLM_PROVIDER", "dashscope").lower()
-        if provider =="dashscope":
-            from langchain_community.llms import Tongyi
-            from langchain_community.chat_models import ChatTongyi
-            return ChatTongyi(
-                model = os.getenv("DASHSCOPE_MODEL","qwen-plus-2025-07-28"),
-                temperature = temperature,
-                dashscope_api_key = os.getenv("DASHSCOPE_API_KEY"),
-            )
-        elif provider == "openai":
+        provider = provider or os.getenv("LLM_PROVIDER", "zhipu").lower()
+        if provider == "openai":
             from langchain_openai import ChatOpenAI
             return ChatOpenAI(
                 model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"),
@@ -205,7 +100,7 @@ class ModelFactory:
 
     @staticmethod
     def get_embeddings(provider: str = None):
-        provider = provider or os.getenv("EMBEDDING_PROVIDER", "dashscope").lower()
+        provider = provider or os.getenv("EMBEDDING_PROVIDER", "zhipu").lower()
         if provider == "openai":
             from langchain_openai import OpenAIEmbeddings
             return OpenAIEmbeddings(
@@ -214,23 +109,17 @@ class ModelFactory:
                 base_url=os.getenv("OPENAI_BASE_URL"),
             )
         elif provider == "zhipu":
-            # 关键：使用分批包装类
-            return BatchedZhipuAIEmbeddings(
+            from langchain_community.embeddings import ZhipuAIEmbeddings
+            return ZhipuAIEmbeddings(
                 model=os.getenv("ZHIPU_EMBEDDING_MODEL", "embedding-2"),
                 api_key=os.getenv("ZHIPUAI_API_KEY"),
                 base_url=os.getenv("ZHIPU_BASE_URL"),
             )
-        elif provider =="dashscope":
-            from langchain_community.embeddings import DashScopeEmbeddings
-            return DashScopeEmbeddings(
-                model = os.getenv("DASHSCOPE_EMBEDDING_MODEL","text-embedding-v1"),
-                dashscope_api_key = os.getenv("DASHSCOPE_API_KEY"),
-            )
         raise ValueError(f"不支持的向量模型提供商: {provider}")
 
-# ===================== FAISS 包装器（支持增量，带分数） =====================
+# ===================== FAISS 包装器（支持增量） =====================
 class DocumentAwareFAISSRetriever(BaseRetriever):
-    """为FAISS向量库增加 add_documents 方法，并统一检索接口，返回带分数的文档"""
+    """为FAISS向量库增加 add_documents 方法，并统一检索接口"""
     vector_store: FAISS
     k: int = config.RETRIEVE_TOP_K
 
@@ -238,13 +127,7 @@ class DocumentAwareFAISSRetriever(BaseRetriever):
         arbitrary_types_allowed = True
 
     def _get_relevant_documents(self, query: str) -> List[Document]:
-        # 默认返回不带分数的文档，为了兼容
-        docs = self.vector_store.similarity_search(query, k=self.k)
-        return docs
-
-    def get_relevant_documents_with_score(self, query: str) -> List[tuple]:
-        """返回 (Document, score) 列表，score 为距离（越小越相似）"""
-        return self.vector_store.similarity_search_with_score(query, k=self.k)
+        return self.vector_store.similarity_search(query, k=self.k)
 
     async def _aget_relevant_documents(self, query: str) -> List[Document]:
         return self._get_relevant_documents(query)
@@ -291,6 +174,7 @@ class DocumentProcessor:
         ".xlsx": UnstructuredExcelLoader,
         ".pptx": UnstructuredPowerPointLoader
     }
+    
 
     @staticmethod
     async def async_load_single_file(file_path: str) -> List[Document]:
@@ -302,7 +186,7 @@ class DocumentProcessor:
             loader_cls = DocumentProcessor.SUPPORTED_EXT[ext]
             docs = []
             if ext == ".txt":
-                # 尝试多种编码，最后使用 chardet 自动检测
+                # 尝试多种编码，优先 UTF-8、UTF-16 等
                 encodings_to_try = ['utf-8', 'utf-16', 'utf-16-le', 'utf-16-be', 'gbk', 'gb18030']
                 loaded = False
                 for enc in encodings_to_try:
@@ -314,6 +198,7 @@ class DocumentProcessor:
                     except (UnicodeDecodeError, LookupError):
                         continue
                 if not loaded:
+                    # 最后尝试用 chardet 自动检测编码（需要安装 chardet）
                     try:
                         import chardet
                         with open(file_path, 'rb') as f:
@@ -323,18 +208,20 @@ class DocumentProcessor:
                             loader = loader_cls(file_path, encoding=encoding)
                             docs = loader.load()
                     except ImportError:
+                        # 如果没有 chardet，则抛出明确错误
                         raise Exception(f"无法解码 TXT 文件 {file_path}，已尝试编码: {encodings_to_try}")
             else:
                 loader = loader_cls(file_path)
                 docs = loader.load()
             
+            # 清洗文档内容（保留原有清洗逻辑）
             for doc in docs:
                 doc.page_content = TextCleaner.clean(doc.page_content)
             return docs
         except Exception as e:
             print(f"❌ 加载文件失败 {file_path}: {str(e)}")
             return []
-
+            
     @staticmethod
     async def batch_load_documents(file_paths: List[str]) -> List[Document]:
         if not file_paths:
@@ -346,14 +233,12 @@ class DocumentProcessor:
 
     @staticmethod
     def smart_split_documents(docs: List[Document]) -> List[Document]:
-        if not docs:
-            return []
         total_length = sum(len(doc.page_content) for doc in docs)
         avg_length = total_length / len(docs) if docs else 0
         if avg_length > 5000:
-            chunk_size, chunk_overlap = 1500, 300
+            chunk_size, chunk_overlap = 5500, 300
         elif avg_length < 1000:
-            chunk_size, chunk_overlap = 500, 100
+            chunk_size, chunk_overlap = 5000, 100
         else:
             chunk_size, chunk_overlap = config.BASE_CHUNK_SIZE, config.BASE_CHUNK_OVERLAP
         print(f"📏 智能分块参数：chunk_size={chunk_size}, chunk_overlap={chunk_overlap}")
@@ -363,14 +248,7 @@ class DocumentProcessor:
             separators=["\n\n", "\n", "。", "，", " ", ""],
             length_function=len
         )
-        split_docs = text_splitter.split_documents(docs)
-        
-        # 为每个分块添加唯一的 chunk_id 到 metadata
-        for idx, doc in enumerate(split_docs):
-            # 使用源文件路径 + 索引作为唯一标识
-            source = doc.metadata.get("source", "unknown")
-            doc.metadata["chunk_id"] = f"{Path(source).stem}_{idx}"
-        return split_docs
+        return text_splitter.split_documents(docs)
 
 # ===================== 向量库管理器（文件级变更追踪 + 增量新增/全量重建） =====================
 class VectorStoreManager:
@@ -464,33 +342,6 @@ class VectorStoreManager:
         if not docs:
             raise Exception("加载文档后内容为空，请检查文件格式")
         split_docs = DocumentProcessor.smart_split_documents(docs)
-        
-        # ========== 新增：记录分块结果 ==========
-        enc = tiktoken.get_encoding("cl100k_base")
-        chunks_record = []
-        for idx, doc in enumerate(split_docs):
-            content = doc.page_content
-            token_len = len(enc.encode(content))
-            chunks_record.append({
-                "chunk_id": doc.metadata.get("chunk_id", f"unknown_{idx}"),
-                "source_file": doc.metadata.get("source", "unknown"),
-                "chunk_index": idx,
-                "content": content,
-                "char_length": len(content),
-                "token_length": token_len,
-                "chunk_size": config.BASE_CHUNK_SIZE,  # 记录当前配置的值，注意实际可能动态调整
-                "chunk_overlap": config.BASE_CHUNK_OVERLAP,
-                "separators": ["\n\n", "\n", "。", "，", " ", ""],
-                "fingerprint": self._get_doc_fingerprint(doc),
-                "created_at": datetime.now().isoformat()
-            })
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        chunks_file = EVAL_DIR / f"chunks_{timestamp}.json"
-        with open(chunks_file, "w", encoding="utf-8") as f:
-            json.dump(chunks_record, f, ensure_ascii=False, indent=2)
-        print(f"📝 分块结果已保存到: {chunks_file}")
-        # =====================================
-        
         print(f"🔨 构建 FAISS 索引（共 {len(split_docs)} 个文本块）...")
         vs = FAISS.from_documents(split_docs, self.embeddings)
         vs.save_local(str(self.vector_db_path))
@@ -499,7 +350,7 @@ class VectorStoreManager:
         current_meta = self._scan_directory_metadata()
         self._save_metadata(current_meta)
         print("✅ 全量重建完成")
-        return {"vs": vs, "bm25": bm25, "total_chunks": len(split_docs)}
+        return {"vs": vs, "bm25": bm25}
 
     # ---------- 增量添加 ----------
     async def incremental_add(self, added_rel_paths: List[str]) -> dict:
@@ -543,29 +394,23 @@ class VectorStoreManager:
         self._save_metadata(old_meta)
         
         print(f"✅ 增量添加完成，新增 {len(split_new)} 个文本块")
-        # 增量添加时总块数变化，需要重新计算 total_chunks
-        total_chunks = vs.index.ntotal
-        return {"vs": vs, "bm25": bm25, "total_chunks": total_chunks}
+        return {"vs": vs, "bm25": bm25}
 
     # ---------- 主入口 ----------
     async def build_or_load_vector_store(self):
         if not self.check_vector_db_exists():
-            result = await self.full_rebuild()
-            return result
+            return await self.full_rebuild()
         added, modified, deleted = self._detect_changes()
         if modified or deleted:
             print(f"⚠️ 检测到 {len(modified)} 个文件修改，{len(deleted)} 个文件删除，将执行全量重建。")
-            result = await self.full_rebuild()
-            return result
+            return await self.full_rebuild()
         elif added:
-            result = await self.incremental_add(added)
-            return result
+            return await self.incremental_add(added)
         else:
             print("✅ 文件无任何变化，直接加载现有向量库。")
             vs = FAISS.load_local(str(self.vector_db_path), self.embeddings, allow_dangerous_deserialization=True)
             bm25 = self._build_bm25_from_corpus()
-            total_chunks = vs.index.ntotal
-            return {"vs": vs, "bm25": bm25, "total_chunks": total_chunks}
+            return {"vs": vs, "bm25": bm25}
 
     def get_mixed_retriever(self, faiss_retriever_wrapper, bm25_retriever):
         if not config.ENABLE_MIXED_RETRIEVAL:
@@ -623,20 +468,15 @@ class ChatManager:
     def set_custom_prompt(self, template_str: str):
         self.prompt_template = ChatPromptTemplate.from_template(template_str)
 
-# ===================== RAG核心链（带问答记录） =====================
-
-
+# ===================== RAG核心链 =====================
 class RAGChain:
-    def __init__(self, retriever, llm, prompt, chat_manager: ChatManager, config_snapshot_id: int):
+    def __init__(self, retriever, llm, prompt, chat_manager: ChatManager):
         self.retriever = retriever
         self.llm = llm
         self.prompt = prompt
         self.chat_manager = chat_manager
         self.parser = StrOutputParser()
-        self.config_snapshot_id = config_snapshot_id
-        # 用于支持带分数的检索
-        self.faiss_retriever = None  # 将在外部设置
-        self._reranker = None
+
     @lru_cache(maxsize=100)
     def _cached_retrieve(self, question: str) -> str:
         docs = self.retriever.invoke(question)
@@ -650,147 +490,25 @@ class RAGChain:
             messages.append(AIMessage(content=msg.answer))
         return messages
 
-    @property
-    def reranker(self):
-        from sentence_transformers import CrossEncoder
-        if self._reranker is None:
-            try:
-                #self._reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2',max_length = 512)
-                self._reranker = CrossEncoder('BAAI/bge-reranker-base', max_length=1024)
-                print(f"重排模型加载成功")
-            except Exception as e:
-                print(f"重排模型加载失败:{e},将跳过重排")
-                self._reranker = False
-        return self._reranker if self._reranker is not False else None
-    
-    #def ask(self, question: str) -> ChatMessage:
-    def ask(self, question: str, difficulty: str = None) -> ChatMessage:
-        start_time = time.time()
-        retrieval_start = time.time()
-        
-        # 检索（带分数，如果可能）
+    def ask(self, question: str) -> ChatMessage:
         if config.ENABLE_CACHE:
             context = self._cached_retrieve(question)
-            docs = []  # 无法获取详细文档，简化处理
-            retrieval_time = time.time() - retrieval_start
         else:
-            # 尝试从 retriever 获取带分数的文档，如果是 EnsembleRetriever 则无法直接获取分数
-            if hasattr(self.retriever, "retrievers") and isinstance(self.retriever, EnsembleRetriever):
-                # 混合检索，分别获取 FAISS 和 BM25 的结果（简化：只取 FAISS 的分数）
-                faiss_retriever = self.retriever.retrievers[1]  # 假设第二个是 FAISS
-                if hasattr(faiss_retriever, "get_relevant_documents_with_score"):
-                    docs_with_score = faiss_retriever.get_relevant_documents_with_score(question)
-                    docs = [doc for doc, _ in docs_with_score[:config.RETRIEVE_TOP_K]]
-                    scores = [score for _, score in docs_with_score[:config.RETRIEVE_TOP_K]]
-                else:
-                    docs = self.retriever.invoke(question)
-                    scores = [None] * len(docs)
-            else:
-                # 直接使用 FAISS 检索器
-                if hasattr(self.retriever, "get_relevant_documents_with_score"):
-                    docs_with_score = self.retriever.get_relevant_documents_with_score(question)
-                    docs = [doc for doc, _ in docs_with_score[:config.RETRIEVE_TOP_K]]
-                    scores = [score for _, score in docs_with_score[:config.RETRIEVE_TOP_K]]
-                else:
-                    docs = self.retriever.invoke(question)
-                    scores = [None] * len(docs)
-            retrieval_time = time.time() - retrieval_start
-             # ---------- 2. 重排阶段（如果可用） ----------
-            # reranker = self.reranker
-            # if reranker is not None and len(docs)>0:
-            #     pairs = [[question,doc.page_content] for doc in docs]
-            #     rerank_scores = reranker.predict(pairs)
-            #     sorted_indices = sorted(range(len(rerank_scores)),key = lambda i:rerank_scores[i],reverse=True)
-            #     docs = [docs[i] for i in sorted_indices]
-            #     if scores:
-            #         scores=[scores[i] for i in sorted_indices]
-
-
-            # 构建 context
-
-            #context = "\n\n".join([doc.page_content for doc in docs])
-            docs = docs[:config.RETRIEVE_TOP_K]   # 强制只取前3个
+            docs = self.retriever.invoke(question)
             context = "\n\n".join([doc.page_content for doc in docs])
-        # 构建最终上下文
-        final_context = context
         
-        # 记录 LLM 调用开始
-        llm_start = time.time()
         chain = self.prompt | self.llm | self.parser
         answer = chain.invoke({
             "context": context,
             "question": question,
             "chat_history": self._format_chat_history()
         })
-        llm_time = time.time() - llm_start
-        total_time = time.time() - start_time
-        
-        # 提取 token 使用情况（从 LLM 响应的 metadata 中获取）
-        # 由于 LangChain 的 ChatTongyi 等不直接返回 usage，尝试从 response_metadata 获取
-        # 这里简化处理，通过最后一次调用获取（实际需要保存 LLM 的原始响应）
-        # 我们可以在 chain.invoke 时使用 return_only_outputs=False 获取完整响应，但为了简单，先留空
-        prompt_tokens = 0
-        completion_tokens = 0
-        total_tokens = 0
-        finish_reason = None
-        # 尝试获取原始响应（需要修改 chain 调用方式）
-        # 这里简单调用，不获取 usage，后续可改进
-        
-        # 构建检索来源列表
-        retrieved_sources = []
-        for rank, doc in enumerate(docs[:config.FINAL_TOP_K], start=1):
-            # 获取分数并转换为 Python float
-            score_val = scores[rank-1] if scores and rank-1 < len(scores) else None
-            if score_val is not None:
-                score_val = float(score_val) 
-            source_item = {
-                "rank": rank,
-                "chunk_id": doc.metadata.get("chunk_id", "unknown"),
-                "source_file": doc.metadata.get("source", "unknown"),
-                "content": doc.page_content,  # 完整内容
-                "score": score_val,
-                "retriever_type": "faiss"  # 简化，如果是混合检索可标记
-            }
-            retrieved_sources.append(source_item)
-        
-        # 构建问答记录
-        qa_record = {
-            "qa_id": int(time.time() * 1000),  # 简单用时间戳作为 id
-            "timestamp": datetime.now().isoformat(),
-            "question": question,
-            "answer": answer,
-            "difficulty": difficulty,
-            "total_time_sec": total_time,
-            "retrieval_time_sec": retrieval_time,
-            "llm_time_sec": llm_time,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": total_tokens,
-            "embedding_tokens": len(tiktoken.get_encoding("cl100k_base").encode(question)),  # 估算
-            "retrieved_sources": retrieved_sources,
-            "final_context": final_context,
-            "llm_raw_response": {"finish_reason": finish_reason, "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens}},
-            "user_feedback": None,
-            "expected_sources": None,
-           # "rerank_scores": [float(s) for s in rerank_scores] if reranker and 'rerank_scores' in locals() else None,
-            "config_snapshot_id": self.config_snapshot_id
-        }
-        
-        # 追加写入 JSONL 文件
-        qa_file = EVAL_DIR / "qa_records.jsonl"
-        with open(qa_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(qa_record, ensure_ascii=False) + "\n")
-        
-        # 保存到历史
-        sources = [src["content"][:200] for src in retrieved_sources[:3]]  # 兼容原有 ChatMessage
+        sources = context.split("\n\n")[:3]
         msg = ChatMessage(question=question, answer=answer, sources=sources)
         self.chat_manager.add_history(msg)
         return msg
 
 # ===================== 主应用 =====================
-
-
-
 class RAGAssistant:
     def __init__(self):
         print("🚀 初始化RAG团队知识助手...")
@@ -799,16 +517,11 @@ class RAGAssistant:
         self.chat_manager = ChatManager()
         self.vector_manager = VectorStoreManager(self.embeddings)
         self.rag_chain = None
-        self.current_snapshot_id = None
 
     async def initialize(self):
         components = await self.vector_manager.build_or_load_vector_store()
         faiss_vs = components["vs"]
         bm25 = components["bm25"]
-        total_chunks = components.get("total_chunks", 0)
-        
-        # 记录配置快照
-        self.current_snapshot_id = record_config_snapshot(total_chunks)
         
         faiss_retriever = DocumentAwareFAISSRetriever(vector_store=faiss_vs, k=config.RETRIEVE_TOP_K)
         retriever = self.vector_manager.get_mixed_retriever(faiss_retriever, bm25)
@@ -817,11 +530,8 @@ class RAGAssistant:
             retriever=retriever,
             llm=self.llm,
             prompt=self.chat_manager.prompt_template,
-            chat_manager=self.chat_manager,
-            config_snapshot_id=self.current_snapshot_id
+            chat_manager=self.chat_manager
         )
-        # 将 faiss_retriever 也传给 RAGChain 以便获取分数（如果需要）
-        self.rag_chain.faiss_retriever = faiss_retriever
         print("✅ RAG助手初始化完成！")
 
     def show_help(self):

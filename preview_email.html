@@ -1,0 +1,79 @@
+
+<h2>📊 RAG 问答分析报告（MVP）｜2026-05-27 15:59</h2>
+<p>🔹 共分析 <strong>10</strong> 条问答记录</p>
+<hr>
+<h3>📈 问题分类分布</h3>
+<ul>
+
+  <li><strong>应用服务器基础软件</strong>：3 次</li>
+
+  <li><strong>软件系统架构风格</strong>：2 次</li>
+
+  <li><strong>面向服务的架构及其应用</strong>：4 次</li>
+
+  <li><strong>企业集成平台的技术与应用</strong>：1 次</li>
+
+</ul>
+
+<h3>🔥 高频问题簇</h3>
+
+  
+  <div style="background:#f8f9fa; padding:10px; margin:8px 0; border-left:4px solid #0d6efd; border-radius:4px;">
+    <strong>📌 在“应用服务器基础软件”的论文要求中，第一点和第三点分别要求写什么内容？请将两者对比，说明它们的关注重点有何不同？</strong><br>
+    <small style="color:#666;">分类：应用服务器基础软件 | 频次：2 | 相似问：详细说明你所参与的软件系统开发项目，采用了哪种应用服务器，在软件开发、部署和运行阶段，具体实施效果如何。</small>
+  </div>
+  
+  <div style="background:#f8f9fa; padding:10px; margin:8px 0; border-left:4px solid #0d6efd; border-radius:4px;">
+    <strong>📌 结合 chunk_0 和 chunk_1，指出应用服务器和软件系统架构风格分别提供了哪些“可重用”的机制？</strong><br>
+    <small style="color:#666;">分类：软件系统架构风格 | 频次：2 | 相似问：根据 chunk_1，系统架构风格的共有部分带来的好处是什么？这些好处对应用服务器的设计是否有借鉴意义？为什么？</small>
+  </div>
+  
+  <div style="background:#f8f9fa; padding:10px; margin:8px 0; border-left:4px solid #0d6efd; border-radius:4px;">
+    <strong>📌 如果我要设计一个既要高可用性又要灵活集成的企业系统，根据文档内容，应该同时考虑哪两种技术/概念？请分别说明它们各自能解决什么问题。</strong><br>
+    <small style="color:#666;">分类：面向服务的架构及其应用 | 频次：3 | 相似问：假设你参与的项目既要满足高并发访问（需要应用服务器集群），又要与多个外部异构系统对接（需要 SOA），你应该如何向团队解释这两者的角色分工？请用文档中的原话或归纳来支持。, 比较“应用服务器提供的集群功能”和“企业集成平台提供的集成架构”在目标上的异同。</small>
+  </div>
+  
+
+
+<h3>⭐ 答案质量评估</h3>
+<p>📊 平均分：<strong>4.6</strong> / 5.0</p>
+
+  <div style="margin:6px 0; padding:6px; background:#fff; border:1px solid #eee; border-radius:4px;">
+    <strong>Q1</strong> | 评分: <span style="color:#198754">5/5</span><br>
+    <small>完全切题，结构清晰，准确区分第一点与第三点的写作目的与关注重点，紧扣论文要求</small>
+  </div>
+
+  <div style="margin:6px 0; padding:6px; background:#fff; border:1px solid #eee; border-radius:4px;">
+    <strong>Q2</strong> | 评分: <span style="color:#198754">5/5</span><br>
+    <small>精准结合 sources 中的两个主题，从不同层次阐述可重用机制，对比明确，无幻觉</small>
+  </div>
+
+  <div style="margin:6px 0; padding:6px; background:#fff; border:1px solid #eee; border-radius:4px;">
+    <strong>Q3</strong> | 评分: <span style="color:#198754">4/5</span><br>
+    <small>回答合理且逻辑清晰，但将企业集成平台与SOA混用，存在轻微概念交叉风险</small>
+  </div>
+
+  <div style="margin:6px 0; padding:6px; background:#fff; border:1px solid #eee; border-radius:4px;">
+    <strong>Q4</strong> | 评分: <span style="color:#198754">5/5</span><br>
+    <small>深刻揭示第二点与第三点之间的理论指导实践关系，论证完整，结构严谨</small>
+  </div>
+
+  <div style="margin:6px 0; padding:6px; background:#fff; border:1px solid #eee; border-radius:4px;">
+    <strong>Q5</strong> | 评分: <span style="color:#198754">5/5</span><br>
+    <small>判断准确，引用 source 原文直接支撑结论，驳斥错误说法有力，符合事实</small>
+  </div>
+
+
+<h3>🔍 检索风险提示</h3>
+
+  <ul>
+  <li style="color:#dc3545;">⚠️ sources 跨多个主题拼接导致上下文割裂，如 chunk_0 同时包含应用服务器与SOA内容</li><li style="color:#dc3545;">⚠️ 关键定义截断严重，如企业集成平台描述被截断影响完整性</li><li style="color:#dc3545;">⚠️ 部分 sources 缺失明确出处章节标题，影响分类准确性</li>
+  </ul>
+
+
+<h3>💡 改进建议</h3>
+<ol>
+<li>优化检索分块策略，按完整论文章节边界切分以避免跨主题混杂</li><li>构建标准化标签体系，在知识库中标注每段内容所属的具体论文题目与考点类别</li>
+</ol>
+<hr>
+<small style="color:#666;">* 本报告由 RAG 分析 Agent MVP 自动生成，数据截止：2026-05-27 15:59</small>

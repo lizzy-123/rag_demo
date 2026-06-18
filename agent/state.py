@@ -15,5 +15,7 @@ class AgentState(TypedDict):
     search_retry_count:int        #搜索重试次数(防止死循环)
     web_search_result:Any         #联网搜索返回的结果(JSON?文本)
     final_answer_source:str       #答案来源：rag/web_search
+    need_search_ids: List[int]
+    search_html: Optional[str]
 
     
