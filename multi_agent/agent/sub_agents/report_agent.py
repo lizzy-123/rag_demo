@@ -62,8 +62,8 @@ from ..mcp_client import render_mcp_client,email_mcp_client,file_mcp_client
 
 
 async def render_node(state: AgentState) -> AgentState:
-    template = await render_mcp_client.call_tool("get_email_template",{})
-
+    #template = await render_mcp_client.call_tool("get_email_template",{})
+    template = await render_mcp_client.read_resource("template://email")
     context = {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "total": len(state["analysis_result"].get("answer_evaluations", [])),

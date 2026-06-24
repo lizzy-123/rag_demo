@@ -274,8 +274,20 @@ class FastMCPClient:
             return result  # 无内容时兜底/result.content[0].text
 
     async def read_resource(self, resource_uri: str):
+        """读取 MCP 资源（如模板），返回文本内容"""
         async with Client(self.base_url, timeout=self.timeout) as client:
-            return await client.read_resource(resource_uri)
+            result = await client.read_resource(resource_uri)
+            if result and len(result) > 0:
+                content = result[0]
+                # 资源内容可能是 TextContent 或 BlobContent
+                if hasattr(content, 'text'):
+                    return content.text
+                elif hasattr(content, 'blob'):
+                    # 如果是二进制，假设是 UTF-8 文本
+                    return content.blob.decode('utf-8')
+                else:
+                    return str(content)  # 兜底
+            return None
         
 
 file_mcp_client = FastMCPClient("http://127.0.0.1:8011/mcp")

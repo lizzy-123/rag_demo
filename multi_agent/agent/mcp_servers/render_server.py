@@ -25,8 +25,8 @@ def render_html_tool(template_str: str, context: Dict[str, Any]) -> str:
     """Jinja2 模板渲染 HTML"""
     return render_html(template_str, context)
 
-#@mcp.resource("template://email")
-@mcp.tool()
+@mcp.resource("template://email")
+#@mcp.tool()
 def get_email_template() -> str:
     """获取内置邮件 HTML 模板（MCP 资源）"""
     return EMAIL_TEMPLATE
