@@ -90,12 +90,12 @@ async def send_node(state: AgentState) -> AgentState:
 
     try:
         await email_mcp_client.call_tool(
-            "send_email_tool",
+            "send_email",
             {"subject": "📊 RAG 分析报告", "html_content": html}
         )
         if search_html:
             await email_mcp_client.call_tool(
-                "send_email_tool",
+                "send_email",
                 {"subject": "🔍 联网搜索报告", "html_content": search_html}
             )
         logging.info("[报告子Agent] 邮件发送成功")

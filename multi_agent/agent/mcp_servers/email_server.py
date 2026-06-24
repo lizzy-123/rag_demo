@@ -30,4 +30,14 @@ def send_email_tool(subject: str, html_content: str)->str:
   
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    #mcp.run(transport="stdio")
+    # 先测试导入
+    print("测试导入email技能...")
+    res = send_email("test标题", "<p>测试内容</p>")
+    print("导入正常", res)
+
+    mcp.run(
+        transport = "streamable-http",
+        host = "0.0.0.0",
+        port = 8010
+    )

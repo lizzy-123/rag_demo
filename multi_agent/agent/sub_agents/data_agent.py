@@ -48,7 +48,8 @@ async def data_load_node(state: AgentState) -> AgentState:
         tool_name="loadjson",
         arguments={"file_path": data_file}
     )
-
+    logging.info(f"【调试】MCP返回类型: {type(data_list)}, 内容: {data_list}")
+ 
     # # 第一步：先判断返回是否为空字符串
     # if not raw_str or raw_str.strip() == "":
     #     logging.warning(f"【数据加载】文件 {data_file} 内容为空，无历史对话数据")

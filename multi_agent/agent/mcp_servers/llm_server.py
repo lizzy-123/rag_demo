@@ -28,4 +28,9 @@ def call_llm_tool(
     return call_llm(prompt, system_prompt, temperature)
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    #mcp.run(transport="stdio")
+    mcp.run(
+        transport = "streamable-http",
+        host = "0.0.0.0",
+        port = 8012
+    )

@@ -34,4 +34,9 @@ def savejson(file_path:str,data:Any)->str:
 
 if __name__ =="__main__":
     #启动MCP Server(独立进程)
-    mcp.run(transport="stdio")
+    #mcp.run(transport="stdio")
+    mcp.run(
+        transport = "streamable-http",
+        host = "0.0.0.0",
+        port = 8011
+    )
