@@ -199,8 +199,118 @@ uv run python scripts/test_fetch_connectivity.py
 |--------|------|----------|
 | 基础导入 | `uv run python -c "from multi_agent.agent.mcp_client import FastMCPClient, file_mcp_client, search_mcp_client, render_mcp_client"` | 无报错 |
 | 流水线导入 | `uv run python -c "from ai_knowledge_crawler_mcp.crawl_task import CrawlPipeline"` | 无报错 |
-| 云端连通 | `uv run python -m ai_knowledge_crawler_mcp.scripts.test_fetch_connectivity` | 健康检测通过 + 单次抓取通过 |
+| Fetch 云端连通 | `uv run python -m ai_knowledge_crawler_mcp.scripts.test_fetch_connectivity` | 健康检测通过 + 单次抓取通过 |
 
 ---
 
-*文档自动归档，最后更新：2026-06-25*
+## 2026-06-26 Bing 云端 MCP 迁移开发计划
+
+### 1. 改造步骤
+
+#### 步骤 1：配置层更新
+
+**文件**: `ai_knowledge_crawler_mcp/config/settings.py`
+
+**操作**:
+1. 删除 `BING_SEARCH_MCP_URL = "http://127.0.0.1:8014/mcp"`
+2. 新增 `BING_SEARCH_MCP_STREAM_URL = "https://mcp.api-inference.modelscope.net/6904a6ead8de4c/mcp"`
+3. 新增 `BING_MCP_TIMEOUT = 120`
+
+#### 步骤 2：Bing 适配器改造
+
+**文件**: `ai_knowledge_crawler_mcp/mcp_client_adapter/bing_search_adapter.py`
+
+**操作**:
+1. `__init__` 改为读取 `config` 参数
+2. 从 config 读取 `BING_SEARCH_MCP_STREAM_URL` 和 `BING_MCP_TIMEOUT`
+3. 删除默认本地地址 `http://127.0.0.1:8090/mcp`
+4. 新增 `health_check()` 方法
+5. 处理返回结果（可能是字符串或字典）
+
+#### 步骤 3：采集流水线适配
+
+**文件**: `ai_knowledge_crawler_mcp/crawl_task/crawl_pipeline.py`
+
+**操作**:
+1. `BingSearchAdapter` 初始化改为传入 `config`
+2. `_search_phase` 开头增加 Bing 健康检测
+3. 删除 `base_url` 和 `timeout` 硬编码参数
+
+#### 步骤 4：创建测试脚本
+
+**文件**: `ai_knowledge_crawler_mcp/scripts/test_bing_connectivity.py`
+
+**内容**:
+- 健康检测测试
+- 单次搜索测试
+- 测试总结输出
+
+#### 步骤 5：清理本地代码
+
+**操作**:
+1. 删除所有 `8090` 端口相关硬编码
+2. 删除所有 `127.0.0.1:8014` 相关注释
+3. 删除本地 Bing MCP 启动相关逻辑
+
+### 2. 文件修改清单
+
+| 文件路径 | 修改类型 | 主要变更 |
+|----------|----------|----------|
+| `config/settings.py` | 修改 | 删除本地 Bing 配置，新增云端配置 |
+| `mcp_client_adapter/bing_search_adapter.py` | 改造 | 云端适配、参数对齐、新增健康检测 |
+| `crawl_task/crawl_pipeline.py` | 修改 | BingAdapter 初始化、健康检测 |
+| `scripts/test_bing_connectivity.py` | 新增 | Bing 连通性测试脚本 |
+
+### 3. 执行顺序
+
+```
+1. config/settings.py (配置层)
+   ↓
+2. mcp_client_adapter/bing_search_adapter.py (适配器层)
+   ↓
+3. crawl_task/crawl_pipeline.py (业务层)
+   ↓
+4. scripts/test_bing_connectivity.py (测试脚本)
+```
+
+### 4. 前置依赖
+
+| 依赖项 | 说明 |
+|--------|------|
+| `fastmcp` | 已安装，用于 Client 实现 |
+| 云端 Bing 服务 | 需确保服务地址有效 |
+| `mcp_client.py` | **不改动**，保持现有 FastMCPClient 逻辑 |
+
+### 5. 测试流程
+
+#### 5.1 Bing 云端连通性测试
+
+```bash
+uv run python -m ai_knowledge_crawler_mcp.scripts.test_bing_connectivity
+```
+
+#### 5.2 完整采集流水线初始化校验
+
+```bash
+uv run python -m ai_knowledge_crawler_mcp.crawl_task.crawl_pipeline
+```
+
+### 6. 验证命令
+
+| 验证项 | 命令 | 预期结果 |
+|--------|------|----------|
+| Bing 云端连通 | `uv run python -m ai_knowledge_crawler_mcp.scripts.test_bing_connectivity` | 健康检测通过 + 单次搜索通过 |
+| 流水线初始化 | `uv run python -m ai_knowledge_crawler_mcp.crawl_task.crawl_pipeline` | 初始化成功，不报错 |
+
+### 7. 变更总结
+
+| 变更类型 | 数量 | 说明 |
+|----------|------|------|
+| 新增文件 | 1 | test_bing_connectivity.py |
+| 修改文件 | 3 | settings.py, bing_search_adapter.py, crawl_pipeline.py |
+| 删除配置 | 1 | BING_SEARCH_MCP_URL (本地 8014) |
+| 新增功能 | 1 | Bing health_check 健康检测 |
+
+---
+
+*文档自动归档，最后更新：2026-06-26*

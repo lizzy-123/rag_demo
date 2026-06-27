@@ -59,10 +59,8 @@ class CrawlPipeline:
         self.file_manager = RawMarkdownManager(self.config.RAW_SOURCE_MD_PATH)
 
         # MCP 适配器
-        self.bing_adapter = BingSearchAdapter(
-            base_url=self.config.BING_SEARCH_MCP_URL,
-            timeout=60,
-        )
+        # BingSearchAdapter 使用云端 streamable_http 服务
+        self.bing_adapter = BingSearchAdapter(config=self.config)
         # FetchAdapter 使用云端 streamable_http 服务
         self.fetch_adapter = FetchAdapter(config=self.config)
 
@@ -129,6 +127,16 @@ class CrawlPipeline:
         Returns:
             搜索结果列表
         """
+        # 健康检测：检查云端 Bing 搜索服务是否可用
+        logger.info("搜索阶段：执行 Bing 云端服务健康检测")
+        if not await self.bing_adapter.health_check():
+            logger.error(
+                "搜索阶段终止：Bing 云端服务不可用或已过期！"
+                "请检查云端 MCP 服务地址是否有效，到期需重新部署获取新地址。"
+                "当前配置地址：https://mcp.api-inference.modelscope.net/6904a6ead8de4c/mcp"
+            )
+            return []
+
         # 根据分类选择关键词
         if category == "chinese":
             keywords = self.config_reader.get_search_keywords()

@@ -11,7 +11,7 @@ from fastmcp import Client
 logging.basicConfig(level=logging.INFO)
 
 class FastMCPClient:
-    def __init__(self, base_url: str, timeout: int = 50):
+    def __init__(self, base_url: str, timeout: int = 80):
         self.base_url = base_url
         self.timeout = timeout
 

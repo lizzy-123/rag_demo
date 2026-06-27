@@ -47,13 +47,19 @@ class CrawlerConfig:
     )
 
     # ========== MCP 服务地址配置 ==========
-    # 必应搜索 MCP
-    BING_SEARCH_MCP_URL: str = "http://127.0.0.1:8014/mcp"
+    # 必应搜索 MCP 云端服务（streamable_http 协议）
+    # 注意：该云端 MCP 服务有有效期，到期需重新部署获取新地址
+    # 当前有效地址：https://mcp.api-inference.modelscope.net/6904a6ead8de4c/mcp
+    BING_SEARCH_MCP_STREAM_URL: str = "https://mcp.api-inference.modelscope.net/6904a6ead8de4c/mcp"
+
+    # 云端 Bing MCP 超时时间（秒）
+    BING_MCP_TIMEOUT: int = 120
 
     # Fetch MCP 云端服务（streamable_http 协议）
     # 注意：该云端 MCP 服务有有效期，到期需重新部署获取新地址
     # 当前有效地址：https://mcp.api-inference.modelscope.net/f8c8c47b0f7f4a/mcp
-    FETCH_MCP_STREAM_URL: str = "https://mcp.api-inference.modelscope.net/f8c8c47b0f7f4a/mcp"
+    # FETCH_MCP_STREAM_URL: str = "https://mcp.api-inference.modelscope.net/f8c8c47b0f7f4a/mcp"
+    FETCH_MCP_STREAM_URL: str = "https://mcp.api-inference.modelscope.net/61670935bda94d/mcp"
 
     # 文档处理 MCP（LLM）
     DOC_PROCESSOR_MCP_URL: str = "http://127.0.0.1:8012/mcp"
