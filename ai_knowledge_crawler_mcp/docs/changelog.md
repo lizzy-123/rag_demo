@@ -3,7 +3,19 @@
 > 最后更新：2026-06-25
 
 ---
+  ## 2026-06-30
 
+  ### 修复 bing_search_adapter.py 缩进错误
+  - 修复 `health_check()` 方法函数体缩进错误（IndentationError）
+  - 修复后通过模块导入校验、连通性测试、完整流水线运行校验
+
+  ### 验证 bing_search_adapter.py 参数改造完整性
+  - count 参数：默认 10，范围 1-50，边界校验完整
+  - offset 参数：默认 0，负数拦截校验完整
+  - MCP 参数组装：count/offset 非默认值时才加入 arguments 字典
+  - crawl_pipeline.py 调用逻辑兼容，无需修改
+
+  
 ## 2026-06-25 MCP 客户端统一改造变更记录
 
 ### 1. 问题定位
@@ -511,6 +523,7 @@ if offset < 0:
 | 默认值 | ✓ 通过 | count=10, offset=0 |
 
 ---
+
 
 *文档自动归档，最后更新：2026-06-26*
 

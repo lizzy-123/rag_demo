@@ -70,18 +70,15 @@ class BingSearchAdapter(MCPAdapterBase):
         if offset < 0:
             raise ValueError(f"offset 参数不能为负数，当前值：{offset}")
 
-        # 组装 MCP 调用参数（使用 query 作为必填参数）
+        # 组装 MCP 调用参数（query 为必填参数，count/offset 为可选参数）
         arguments = {
             "query": ", ".join(keywords),  # 将关键词列表转为查询字符串
-            "count": count,
-            "offset": offset,
         }
+        if count != 10:
+            arguments["count"] = count
+        if offset != 0:
+            arguments["offset"] = offset
         if days is not None:
-            arguments["days"] = days
-        if category is not None:
-            arguments["category"] = category
-        if exclude_urls is not None:
-            arguments["exclude_urls"] = exclude_urls
             arguments["days"] = days
         if category is not None:
             arguments["category"] = category
@@ -135,21 +132,16 @@ class BingSearchAdapter(MCPAdapterBase):
             True 表示服务正常，False 表示服务不可用
         """
         try:
-            logger.info("[bing_search] Health check: testing connectivity to cloud service")
-
-            # 使用一个通用关键词测试
+            logger.info("[bing_search] Health check: testing connectivity...")
             result = await self.search_keywords(keywords=["test"], days=1)
 
-            # 只要能返回结构化结果即视为服务正常
-            if isinstance(result, dict) and "results" in result:
+            # 严格校验：必须无错误字段，且 results 列表非空
+            if isinstance(result, dict) and not result.get("error") and result.get("results"):
                 logger.info("[bing_search] Health check: service is healthy")
                 return True
             else:
-                logger.warning(
-                    f"[bing_search] Health check: service returned invalid response: {result}"
-                )
+                logger.warning(f"[bing_search] Health check: service returned invalid or empty response: {result}")
                 return False
-
         except Exception as e:
             logger.error(f"[bing_search] Health check failed: {e}")
             return False
