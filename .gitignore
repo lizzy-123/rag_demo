@@ -42,3 +42,7 @@ __pycache__/
 # 日志和临时文件
 *.log
 *.tmp
+
+ai_knowledge_crawler_mcp/raw_source_md/
+ai_knowledge_crawler_mcp/rag_export/
+ai_knowledge_crawler_mcp/rag_export/

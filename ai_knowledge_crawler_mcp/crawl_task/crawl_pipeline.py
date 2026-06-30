@@ -10,8 +10,10 @@
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 from ai_knowledge_crawler_mcp.config import CrawlerConfig
@@ -21,8 +23,87 @@ from ai_knowledge_crawler_mcp.crawl_task import (
     URLManager,
 )
 from ai_knowledge_crawler_mcp.mcp_client_adapter import BingSearchAdapter, FetchAdapter
+from ai_knowledge_crawler_mcp.utils import init_logger
+from ai_knowledge_crawler_mcp.utils.exceptions import (
+    CrawlPipelineError,
+    BingSearchError,
+    FetchError,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class FailedUrlPool:
+    """失败 URL 池 - 持久化存储失败的 URL 供后续重试"""
+
+    def __init__(self, storage_path: str):
+        """
+        初始化失败 URL 池
+
+        Args:
+            storage_path: 存储文件路径（JSON 格式）
+        """
+        self.storage_path = Path(storage_path)
+        self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+        self._failed_data: dict = self._load_data()
+
+    def _load_data(self) -> dict:
+        """加载失败 URL 数据"""
+        if self.storage_path.exists():
+            try:
+                with open(self.storage_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.warning(f"加载失败 URL 池失败：{e}，创建新文件")
+        return {"urls": [], "stats": {"total": 0}}
+
+    def _save_data(self):
+        """保存失败 URL 数据"""
+        try:
+            with open(self.storage_path, "w", encoding="utf-8") as f:
+                json.dump(self._failed_data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"保存失败 URL 池失败：{e}")
+
+    def add_failed_url(self, url: str, category: str, error: str):
+        """添加失败 URL"""
+        record = {
+            "url": url,
+            "category": category,
+            "error": error,
+            "failed_date": datetime.now().strftime("%Y-%m-%d"),
+        }
+        self._failed_data["urls"].append(record)
+        self._failed_data["stats"]["total"] += 1
+        self._save_data()
+
+    def remove_url(self, url: str) -> bool:
+        """移除 URL（重试成功后）"""
+        original_len = len(self._failed_data["urls"])
+        self._failed_data["urls"] = [r for r in self._failed_data["urls"] if r["url"] != url]
+        new_len = len(self._failed_data["urls"])
+        if new_len < original_len:
+            self._failed_data["stats"]["total"] -= 1
+            self._save_data()
+            return True
+        return False
+
+    def get_all_failed_urls(self) -> list:
+        """获取所有失败 URL 记录"""
+        return self._failed_data["urls"].copy()
+
+    def get_failed_url_set(self) -> set:
+        """获取失败 URL 集合"""
+        return {r["url"] for r in self._failed_data["urls"]}
+
+    def clear_all(self):
+        """清空所有失败记录"""
+        self._failed_data = {"urls": [], "stats": {"total": 0}}
+        self._save_data()
+
+    def get_stats(self) -> dict:
+        """获取统计信息"""
+        return self._failed_data["stats"]
 
 
 class CrawlPipeline:
@@ -57,6 +138,9 @@ class CrawlPipeline:
 
         # 文件管理器 - 原始 Markdown 存储
         self.file_manager = RawMarkdownManager(self.config.RAW_SOURCE_MD_PATH)
+
+        # 失败 URL 池
+        self.failed_url_pool = FailedUrlPool(str(self.config.FAILED_URLS_POOL_PATH))
 
         # MCP 适配器
         # BingSearchAdapter 使用云端 streamable_http 服务
@@ -125,17 +209,14 @@ class CrawlPipeline:
             days: 搜索最近 N 天
 
         Returns:
-            搜索结果列表
+            搜索结果列表（每个结果绑定 category 字段）
         """
         # 健康检测：检查云端 Bing 搜索服务是否可用
         logger.info("搜索阶段：执行 Bing 云端服务健康检测")
         if not await self.bing_adapter.health_check():
-            logger.error(
-                "搜索阶段终止：Bing 云端服务不可用或已过期！"
-                "请检查云端 MCP 服务地址是否有效，到期需重新部署获取新地址。"
-                "当前配置地址：https://mcp.api-inference.modelscope.net/6904a6ead8de4c/mcp"
+            raise CrawlPipelineError.HealthCheckFailed(
+                "Bing 云端服务不可用或已过期！请检查云端 MCP 服务地址是否有效。"
             )
-            return []
 
         # 根据分类选择关键词
         if category == "chinese":
@@ -155,24 +236,37 @@ class CrawlPipeline:
 
         logger.info(f"搜索阶段：使用 {len(keywords)} 个关键词 - {keywords}")
 
+        # 获取本地已爬 URL（用于 MCP 提前过滤）
+        crawled_urls = list(self.url_manager.get_all_crawled_urls())
+        logger.info(f"搜索阶段：本地已爬 URL {len(crawled_urls)} 条，将传入 MCP 排除")
+
         # 调用必应搜索适配器
         try:
             search_result = await self.bing_adapter.search_keywords(
                 keywords=keywords,
                 days=days,
-                category=category_name,
-                exclude_urls=[],  # 排除列表在过滤阶段处理
+                exclude_urls=crawled_urls,  # 传入已爬 URL 提前过滤
+                count=10,
+                max_total_results=100,
             )
 
             results = search_result.get("results", [])
+
+            # 为每个结果绑定 category 分类
+            for item in results:
+                item["category"] = category_name
+
             self._stats["search_count"] = len(results)
             logger.info(f"搜索阶段完成，获取到 {len(results)} 条结果")
 
             return results
 
+        except BingSearchError as e:
+            logger.error(f"搜索阶段发生 BingSearchError: {e}")
+            raise CrawlPipelineError.SearchPhaseError(f"搜索失败：{e}")
         except Exception as e:
-            logger.error(f"搜索阶段发生错误：{e}")
-            return []
+            logger.error(f"搜索阶段发生未知错误：{e}")
+            raise CrawlPipelineError.SearchPhaseError(f"搜索失败：{e}")
 
     async def _filter_phase(self, search_results: list[dict]) -> list[dict]:
         """
@@ -215,7 +309,7 @@ class CrawlPipeline:
         抓取阶段：批量获取网页 Markdown 内容
 
         Args:
-            valid_urls: 有效 URL 列表（包含 title, url, published_date 等信息）
+            valid_urls: 有效 URL 列表（包含 title, url, published_date, category 等信息）
 
         Returns:
             抓取结果列表
@@ -223,22 +317,18 @@ class CrawlPipeline:
         # 健康检测：检查云端 Fetch 服务是否可用
         logger.info("抓取阶段：执行 Fetch 云端服务健康检测")
         if not await self.fetch_adapter.health_check():
-            logger.error(
-                "抓取阶段终止：Fetch 云端服务不可用或已过期！"
-                "请检查云端 MCP 服务地址是否有效，到期需重新部署获取新地址。"
-                "当前配置地址：https://mcp.api-inference.modelscope.net/f8c8c47b0f7f4a/mcp"
+            raise CrawlPipelineError.HealthCheckFailed(
+                "Fetch 云端服务不可用或已过期！请检查云端 MCP 服务地址是否有效。"
             )
-            return []
 
         urls = [item["url"] for item in valid_urls]
         logger.info(f"抓取阶段：开始抓取 {len(urls)} 个网页")
 
         try:
-            # 批量抓取
+            # 批量抓取（异步并发）
             fetch_results = await self.fetch_adapter.fetch_urls_batch(
                 urls=urls,
                 max_length=5000,
-                retry_count=self.config.RETRY_COUNT,
             )
 
             # 统计成功/失败
@@ -255,21 +345,36 @@ class CrawlPipeline:
             # 只返回成功的结果
             successful_results = [r for r in fetch_results if r.get("status") == "success"]
 
-            # 关联原始搜索结果信息（title, published_date 等）
+            # 关联原始搜索结果信息（title, published_date, category 等）
             url_to_result = {item["url"]: item for item in valid_urls}
             for fetch_result in successful_results:
                 url = fetch_result.get("url")
                 if url in url_to_result:
-                    fetch_result["original_title"] = url_to_result[url].get("title", "")
-                    fetch_result["published_date"] = url_to_result[url].get(
-                        "published_date", ""
-                    )
+                    original = url_to_result[url]
+                    fetch_result["original_title"] = original.get("title", "")
+                    fetch_result["published_date"] = original.get("published_date", "")
+                    # category 已在搜索阶段绑定
+                    if "category" not in fetch_result:
+                        fetch_result["category"] = original.get("category", "all")
+
+            # 处理失败结果：加入失败池
+            failed_results = [r for r in fetch_results if r.get("status") == "failed"]
+            for failed in failed_results:
+                url = failed.get("url")
+                # 从原始结果中获取 category
+                category = url_to_result.get(url, {}).get("category", "unknown")
+                error = failed.get("error", "Unknown error")
+                self.failed_url_pool.add_failed_url(url, category, error)
+                logger.debug(f"抓取阶段：URL {url} 加入失败池，错误：{error}")
 
             return successful_results
 
+        except FetchError as e:
+            logger.error(f"抓取阶段发生 FetchError: {e}")
+            raise CrawlPipelineError.FetchPhaseError(f"抓取失败：{e}")
         except Exception as e:
-            logger.error(f"抓取阶段发生错误：{e}")
-            return []
+            logger.error(f"抓取阶段发生未知错误：{e}")
+            raise CrawlPipelineError.FetchPhaseError(f"抓取失败：{e}")
 
     async def _save_phase(self, fetch_results: list[dict]) -> None:
         """
@@ -297,12 +402,12 @@ class CrawlPipeline:
                     logger.warning(f"URL {url} 无 Markdown 内容，跳过")
                     continue
 
-                # 保存到文件
+                # 保存到文件（按分类分目录）
                 self.file_manager.save_raw_markdown(
                     url=url,
                     markdown_content=markdown,
                     title=title,
-                    category=category,
+                    category=category,  # 按 category 分目录
                     date_str=date_str,
                 )
 
@@ -312,6 +417,9 @@ class CrawlPipeline:
                     category=category,
                     status="success",
                 )
+
+                # 从失败池中移除（如果存在）
+                self.failed_url_pool.remove_url(url)
 
                 saved_count += 1
 
@@ -345,23 +453,13 @@ async def main():
     # 初始化配置
     config = CrawlerConfig()
 
-    # 配置日志
-    log_dir = config.LOGS_PATH
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    logging.basicConfig(
-        level=getattr(logging, config.LOG_LEVEL),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(
-                log_dir / f"crawl_pipeline_{datetime.now().strftime('%Y%m%d')}.log",
-                encoding="utf-8",
-            ),
-            logging.StreamHandler(),
-        ],
+    # 使用封装日志工具初始化
+    logger = init_logger(
+        logs_path=config.LOGS_PATH,
+        log_level=config.LOG_LEVEL,
+        log_name="crawl_pipeline",
     )
 
-    logger = logging.getLogger(__name__)
     logger.info("知识采集流水线启动")
 
     # 创建流水线并执行

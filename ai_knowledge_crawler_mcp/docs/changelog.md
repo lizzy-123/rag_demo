@@ -1,6 +1,110 @@
 # 变更记录文档
 
-> 最后更新：2026-06-25
+> 最后更新：2026-06-30
+
+
+  Changelog - 知识采集爬虫 MCP 重构
+  日期：2026-06-30
+  ================================================================================
+
+  【新增工具类】
+
+  1. 全局日志工具 (ai_knowledge_crawler_mcp/utils/logger.py)
+     - 全局单例日志器 CrawlerLogger
+     - 支持控制台（带颜色）+ 按日滚动文件双输出
+     - 提供 get_logger/get_child_logger/init_logger 便捷函数
+     - 替换项目所有原生 logging 调用
+
+  2. 分层自定义异常 (ai_knowledge_crawler_mcp/utils/exceptions.py)
+     - MCPBaseException：基类异常
+     - ConfigValidateError：配置验证错误
+     - BingSearchError：Bing 搜索错误（含 Timeout/ConnectionFailed/InvalidResponse/RateLimit/NoResults 子类）
+     - FetchError：网页抓取错误（含 Timeout/ConnectionFailed/InvalidContent/RateLimit/MaxRetriesExceeded 子类）
+     - CrawlPipelineError：流水线执行错误（含各阶段错误子类）
+
+  3. 失败 URL 池 (crawl_pipeline.py 内 FailedUrlPool 类)
+     - 持久化存储抓取失败的 URL
+     - 支持后续重试和统计
+
+  【配置优化】
+
+  4. CrawlerConfig 配置类 (config/settings.py)
+     - 新增 __post_init__ 自动计算路径
+     - 新增 _validate_config 配置校验方法，非法配置抛 ConfigValidateError
+     - 新增 FETCH_CONCURRENT_LIMIT：抓取并发数（默认 5）
+     - 新增 MCP_REQUEST_INTERVAL：MCP 请求间隔（默认 0.5 秒）
+     - 新增 FAILED_URLS_POOL_PATH：失败 URL 池路径
+
+  【category 业务逻辑优化】
+
+  5. category 参数语义明确化
+     - category(chinese/english/all) 仅用于：
+       a) 区分中英文关键词池
+       b) Markdown 文件按分类分文件夹存储
+     - 删除传递给 Bing MCP 接口的 category 参数（无效参数）
+
+  【bing_search_adapter.py 修复】
+
+  6. 取消多关键词逗号拼接
+     - 改为逐个关键词独立搜索后合并去重
+     - 避免逗号拼接导致的搜索结果偏差
+
+  7. search_single_keyword 透传 count 参数
+     - 修复 limit 参数不生效的 bug
+
+  8. 新增分页循环拉取
+     - 支持 max_total_results 参数控制总结果数
+     - 自动翻页直到达到上限或无更多结果
+
+  9. 细分异常抛出
+     - 区分 TimeoutError/ConnectionFailed/InvalidResponse 等具体异常
+
+  【fetch_adapter.py 修复】
+
+  10. 串行抓取改为异步并发
+      - 使用 asyncio.Semaphore 控制并发数（配置项 FETCH_CONCURRENT_LIMIT）
+      - fetch_urls_batch 使用 asyncio.gather 并发执行
+
+  11. 抽取重试装饰器
+      - 新增 @retry_on_failure 装饰器
+      - 消除重复的重试代码
+
+  12. 健康检测增强
+      - 增加多个测试域名（example.com, google.com）
+      - 至少一个成功即认为健康
+
+  13. 单次抓取独立超时
+      - 使用 asyncio.wait_for 设置独立超时
+
+  14. 删除文件末尾无效 main 执行代码
+
+  【crawl_pipeline.py 修复】
+
+  15. 搜索时传入已爬 URL
+      - 将本地已爬 URL 传入 MCP exclude_urls 提前过滤
+      - 减少无效搜索结果
+
+  16. 搜索结果绑定 category
+      - 每条搜索结果绑定 category 字段
+      - 保存文件时按 category 分目录
+
+  17. 失败 URL 入池
+      - 抓取失败的 URL 存入失败池（failed_urls.json）
+      - 支持后续重试
+
+  18. MCP 请求间隔防限流
+      - 新增 MCP_REQUEST_INTERVAL 配置
+      - 请求后休眠防限流
+
+  19. 删除 main 内零散日志初始化
+      - 统一使用封装日志工具 init_logger
+
+  【全量替换】
+
+  20. 替换所有裸 except Exception
+      - 精准捕获对应业务异常（BingSearchError/FetchError 等）
+      - 避免掩盖真实错误
+
 
 ---
   ## 2026-06-30
