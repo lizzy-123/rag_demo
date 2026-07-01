@@ -18,8 +18,8 @@ from ai_knowledge_crawler_mcp.config import CrawlerConfig
 from ai_knowledge_crawler_mcp.utils.exceptions import FetchError
 from .base_adapter import MCPAdapterBase
 
-logger = logging.getLogger(__name__)
-
+#logger = logging.getLogger(__name__)
+logger = logging.getLogger("crawl_pipeline")
 
 def retry_on_failure(max_retries: int = 2, delay: float = 1.0):
     """

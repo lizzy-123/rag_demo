@@ -47,7 +47,10 @@ class CrawlerConfig:
     # ========== 黑名单配置 ==========
     # 黑名单域名
     BLACKLIST_DOMAINS: List[str] = field(
-        default_factory=lambda: ["ad.example.com", "spam.example.com"]
+        default_factory=lambda: ["ad.example.com", "spam.example.com", "zhihu.com",
+        "zhuanlan.zhihu.com",
+        "xiaohongshu.com",
+        "weibo.com",]
     )
 
     # ========== MCP 服务地址配置 ==========

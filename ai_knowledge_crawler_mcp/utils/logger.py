@@ -123,7 +123,8 @@ class CrawlerLogger:
         self._logger.addHandler(file_handler)
 
         # 禁止向父 logger 传播
-        self._logger.propagate = False
+        #self._logger.propagate = False
+        self._logger.propagate = True
 
         return self._logger
 

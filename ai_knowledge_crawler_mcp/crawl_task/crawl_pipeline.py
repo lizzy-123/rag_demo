@@ -30,7 +30,7 @@ from ai_knowledge_crawler_mcp.utils.exceptions import (
     FetchError,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("crawl_pipeline")
 
 
 class FailedUrlPool:
