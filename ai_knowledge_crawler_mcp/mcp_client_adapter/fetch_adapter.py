@@ -3,8 +3,8 @@ Fetch 网页内容抓取 MCP 适配器
 
 封装云端 Fetch MCP 服务（streamable_http 协议），用于批量抓取网页并输出纯净 Markdown 原文。
 
-云端服务地址：https://mcp.api-inference.modelscope.net/f8c8c47b0f7f4a/mcp
-注意：该云端 MCP 服务有有效期，到期需重新部署获取新地址。
+云端服务地址：https://mcp.api-inference.modelscope.net/955c976957164d/mcp
+
 """
 
 import asyncio
@@ -295,8 +295,8 @@ class FetchAdapter(MCPAdapterBase):
         """
         # 多个测试域名
         test_urls = [
-            "https://www.example.com",
-            "https://www.google.com",
+            "https://xiaolinnote.com/",
+            "https://www.cnblogs.com",
         ]
 
         success_count = 0

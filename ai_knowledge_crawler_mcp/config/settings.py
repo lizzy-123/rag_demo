@@ -17,8 +17,11 @@ class CrawlerConfig:
 
     # ========== 搜索关键词配置 ==========
     # AI 技术分类关键词
+    # SEARCH_KEYWORDS: List[str] = field(
+    #     default_factory=lambda: ["AI应用开发","Claude code 技巧","RAG", "大模型基础", "Multi-Agent 智能体", "Vibe Coding", "大模型评测"]
+    # )
     SEARCH_KEYWORDS: List[str] = field(
-        default_factory=lambda: ["AI应用开发","Claude code 技巧","RAG", "大模型基础", "Multi-Agent 智能体", "Vibe Coding", "大模型评测"]
+        default_factory=lambda: ["AI应用开发"]
     )
 
     # 英文素材关键词（可选扩展）
@@ -59,23 +62,23 @@ class CrawlerConfig:
     # Fetch MCP 云端服务（streamable_http 协议）
     # 注意：该云端 MCP 服务有有效期，到期需重新部署获取新地址
     # 当前有效地址：https://mcp.api-inference.modelscope.net/61670935bda94d/mcp
-    FETCH_MCP_STREAM_URL: str = "https://mcp.api-inference.modelscope.net/61670935bda94d/mcp"
+    FETCH_MCP_STREAM_URL: str = "https://mcp.api-inference.modelscope.net/955c976957164d/mcp"
 
     # 文档处理 MCP（LLM）
     DOC_PROCESSOR_MCP_URL: str = "http://127.0.0.1:8012/mcp"
 
     # ========== 抓取配置 ==========
     # 云端 Fetch MCP 超时时间（秒）
-    FETCH_MCP_TIMEOUT: int = 120
+    FETCH_MCP_TIMEOUT: int = 300
 
-    # 失败重试次数
-    RETRY_COUNT: int = 2
+    # 失败重试次数 2 
+    RETRY_COUNT: int = 1
 
-    # 抓取并发数（异步并发控制）
-    FETCH_CONCURRENT_LIMIT: int = 5
+    # 抓取并发数（异步并发控制），5避免批量并发压垮MCP
+    FETCH_CONCURRENT_LIMIT: int = 1
 
-    # MCP 请求间隔（秒，防限流）
-    MCP_REQUEST_INTERVAL: float = 0.5
+    # MCP 请求间隔（秒，防限流）0.5
+    MCP_REQUEST_INTERVAL: float = 30
 
     # ========== 日志配置 ==========
     # 日志级别

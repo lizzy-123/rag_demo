@@ -59,7 +59,7 @@ async def test_single_fetch():
     config = CrawlerConfig()
     adapter = FetchAdapter(config=config)
 
-    test_url = "https://www.example.com"
+    test_url = "https://www.cnblogs.com"
     print(f"\n[测试] 抓取 URL: {test_url}")
 
     result = await adapter.fetch_url(test_url, max_length=500)

@@ -148,7 +148,10 @@ class BingSearchAdapter(MCPAdapterBase):
             except BingSearchError:
                 raise
             except TimeoutError as e:
-                raise BingSearchError.Timeout(f"搜索关键词 '{keyword}' 超时：{e}")
+                # 超时属于临时网络波动，只跳过当前关键词
+                logger.error(f"[bing_search] 搜索关键词 '{keyword}' 请求超时，跳过该关键词：{e}")
+                continue
+                #raise BingSearchError.Timeout(f"搜索关键词 '{keyword}' 超时：{e}")
             except Exception as e:
                 logger.error(f"[bing_search] 搜索关键词 '{keyword}' 失败：{e}")
                 continue

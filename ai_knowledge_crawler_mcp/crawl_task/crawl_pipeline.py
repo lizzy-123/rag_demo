@@ -246,8 +246,8 @@ class CrawlPipeline:
                 keywords=keywords,
                 days=days,
                 exclude_urls=crawled_urls,  # 传入已爬 URL 提前过滤
-                count=10,
-                max_total_results=100,
+                count=2,
+                max_total_results=10,
             )
 
             results = search_result.get("results", [])
