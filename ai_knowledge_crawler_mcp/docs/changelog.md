@@ -1,5 +1,57 @@
 # 变更记录文档
 
+
+
+## [2026/7/2] - 本地文档处理模块
+
+  ### 新增
+  1. **document_processor 模块**（与 mcp_client_adapter 同级）
+     - `base_processor.py` - 基础父类，统一结果格式化和参数校验
+     - `text_cleaner.py` - 文本清洗（HTML 标签、导航、页脚、广告、空白规整）
+     - `text_chunk_splitter.py` - 文本分片（按标题优先切割、支持 chunk_size/chunk_overlap）
+     - `text_deduplicate.py` - 分片去重（双模式：语义相似度/哈希精确去重，自动降级）
+     - `text_classifier.py` - 文档分类（关键词匹配，支持自定义分类）
+     - `document_pipeline.py` - 对外统一入口（单文档/批量处理）
+
+  2. **crawl_task/processed_result_manager.py** - 处理结果文件管理器
+     - 按日期 YYYY-MM-DD 分层存储
+     - URL 哈希命名 `_result.json`
+     - 批次汇总 `batch_时间戳_summary.json`
+     - 关联 raw_source_md 原始文件路径
+
+  3. **配置开关**（config/settings.py）
+     - `USE_LOCAL_DOC_PROCESSOR` - True 使用本地模块，False 使用远程 MCP
+     - `SAVE_PROCESSED_RESULT` - 控制是否落地成品 JSON
+     - `USE_SEMANTIC_DEDUP` - 是否使用语义去重
+     - `LOCAL_DEDUP_THRESHOLD` - 语义相似度阈值（0~0.85）
+
+  4. **流水线新增阶段 5**（crawl_pipeline.py）
+     - `_process_phase` - 本地文档批量处理（清洗→分片→去重→分类）
+     - 单文档异常隔离，失败不阻断整批任务
+     - 统计信息扩展：process_success/process_failed
+  
+  5. **测试脚本**（scripts/test_local_doc_processor.py）
+     - 各子模块独立测试
+     - 完整流水线集成测试
+     - 批量处理测试
+  
+  ### 变更
+  - `crawl_task/__init__.py` - 新增 ProcessedResultManager 导出
+
+  ### 规范对齐
+  - 日志：统一使用 `get_child_logger("document_processor.xxx")`，前缀`[{self.name}]`
+  - 异常：继承 `MCPBaseException`，统一`DocumentProcessorError.ValidationError`
+  - 参数校验：复用 `_validate_positive_int`/`_validate_non_negative_int` 方法
+  - 返回结构：对齐 MCP 适配器 `status: "success|failed"` 格式
+
+  ### 依赖
+  - 语义去重模式依赖 `sentence-transformers`和`numpy`（缺失时自动降级到哈希模式）
+  - 无其他第三方依赖
+
+  ---
+
+
+
 > 最后更新：2026-06-30
 
 

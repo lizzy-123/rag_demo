@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 class DocProcessorAdapter(MCPAdapterBase):
     """智能体文档处理 MCP 适配器"""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:8012/mcp", timeout: int = 180):
+    def __init__(self, base_url: str = "http://127.0.0.1:8085/mcp", timeout: int = 180):
         """
         初始化文档处理适配器
 

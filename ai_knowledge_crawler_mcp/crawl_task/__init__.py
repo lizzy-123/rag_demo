@@ -6,6 +6,7 @@
 2. RawMarkdownManager - 原始 Markdown 文件存储与目录管理
 3. ConfigReader - 配置读取器（黑名单域名、搜索关键词）
 4. CrawlPipeline - 采集流水线（单次手动采集流程）
+5. ProcessedResultManager - 处理结果文件管理器
 
 使用示例:
     from ai_knowledge_crawler_mcp.crawl_task import (
@@ -13,6 +14,7 @@
         RawMarkdownManager,
         ConfigReader,
         CrawlPipeline,
+        ProcessedResultManager,
     )
     from ai_knowledge_crawler_mcp.config import CrawlerConfig
 
@@ -51,10 +53,12 @@ from .url_manager import URLManager
 from .file_manager import RawMarkdownManager
 from .config_reader import ConfigReader
 from .crawl_pipeline import CrawlPipeline
+from .processed_result_manager import ProcessedResultManager
 
 __all__ = [
     "URLManager",
     "RawMarkdownManager",
     "ConfigReader",
     "CrawlPipeline",
+    "ProcessedResultManager",
 ]

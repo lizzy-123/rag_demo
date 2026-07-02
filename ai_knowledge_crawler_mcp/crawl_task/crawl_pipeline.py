@@ -16,21 +16,37 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# from ai_knowledge_crawler_mcp.utils import init_logger
+# logger = logging.getLogger("crawl_pipeline")
+
+# from ai_knowledge_crawler_mcp.config import CrawlerConfig
+
 from ai_knowledge_crawler_mcp.config import CrawlerConfig
+config = CrawlerConfig()
+
+# 2. 立即初始化日志系统（必须在任何使用 get_child_logger 的模块导入之前）
+from ai_knowledge_crawler_mcp.utils.logger import get_logger,get_child_logger
+get_logger(logs_path=config.LOGS_PATH, log_level=config.LOG_LEVEL)
+logger = get_child_logger("crawl_pipeline")
+
 from ai_knowledge_crawler_mcp.crawl_task import (
     ConfigReader,
     RawMarkdownManager,
     URLManager,
 )
+
+
+from ai_knowledge_crawler_mcp.crawl_task.processed_result_manager import ProcessedResultManager
 from ai_knowledge_crawler_mcp.mcp_client_adapter import BingSearchAdapter, FetchAdapter
-from ai_knowledge_crawler_mcp.utils import init_logger
+from ai_knowledge_crawler_mcp.document_processor import DocumentPipeline as LocalDocumentPipeline
+
 from ai_knowledge_crawler_mcp.utils.exceptions import (
     CrawlPipelineError,
     BingSearchError,
     FetchError,
 )
 
-logger = logging.getLogger("crawl_pipeline")
+
 
 
 class FailedUrlPool:
@@ -139,6 +155,9 @@ class CrawlPipeline:
         # 文件管理器 - 原始 Markdown 存储
         self.file_manager = RawMarkdownManager(self.config.RAW_SOURCE_MD_PATH)
 
+        # 处理结果管理器 - 成品数据存储
+        self.result_manager = ProcessedResultManager(self.config.PROCESSED_KNOWLEDGE_PATH)
+
         # 失败 URL 池
         self.failed_url_pool = FailedUrlPool(str(self.config.FAILED_URLS_POOL_PATH))
 
@@ -148,7 +167,18 @@ class CrawlPipeline:
         # FetchAdapter 使用云端 streamable_http 服务
         self.fetch_adapter = FetchAdapter(config=self.config)
 
-        logger.info("采集流水线组件初始化完成")
+        # 本地文档处理器（根据配置开关初始化）
+        if self.config.USE_LOCAL_DOC_PROCESSOR:
+            self.local_doc_pipeline = LocalDocumentPipeline(
+                chunk_size=self.config.CHUNK_SIZE,
+                chunk_overlap=self.config.CHUNK_OVERLAP,
+                use_semantic_dedup=self.config.USE_SEMANTIC_DEDUP,
+                dedup_threshold=self.config.LOCAL_DEDUP_THRESHOLD,
+            )
+            logger.info("采集流水线组件初始化完成 - 使用本地文档处理器")
+        else:
+            self.local_doc_pipeline = None
+            logger.info("采集流水线组件初始化完成 - 使用远程 MCP 文档处理器")
 
     async def run(
         self,
@@ -187,8 +217,11 @@ class CrawlPipeline:
             logger.warning("抓取阶段未获取到任何内容，流程结束")
             return self._stats
 
-        # 阶段 4: 保存
+        # 阶段 4: 保存原始 MD
         await self._save_phase(fetch_results)
+
+        # 阶段 5: 本地文档处理（新增）
+        await self._process_phase(fetch_results)
 
         elapsed = (datetime.now() - start_time).total_seconds()
         logger.info(f"采集流水线执行完成，耗时 {elapsed:.2f} 秒")
@@ -435,6 +468,100 @@ class CrawlPipeline:
         self._stats["saved_count"] = saved_count
         logger.info(f"保存阶段完成，成功保存 {saved_count} 个文件")
 
+    async def _process_phase(self, fetch_results: list[dict]) -> list[dict]:
+        """
+        文档处理阶段：本地文档处理（清洗、分片、去重、分类）
+
+        Args:
+            fetch_results: 抓取结果列表
+
+        Returns:
+            处理结果列表
+        """
+        if not fetch_results:
+            logger.warning("文档处理阶段：无数据需要处理")
+            return []
+
+        # 如果未启用本地处理器，跳过
+        if not self.config.USE_LOCAL_DOC_PROCESSOR:
+            logger.info("文档处理阶段：本地处理器未启用，跳过")
+            return []
+
+        if self.local_doc_pipeline is None:
+            logger.warning("文档处理阶段：本地处理器未初始化，跳过")
+            return []
+
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        logger.info(f"文档处理阶段：开始处理 {len(fetch_results)} 个文档")
+
+        # 构建批量处理输入
+        documents = []
+        raw_md_paths = []
+
+        for result in fetch_results:
+            url = result.get("url")
+            markdown = result.get("markdown", "")
+            category = result.get("category", "all")
+
+            if not markdown:
+                continue
+
+            # 构建文档输入
+            doc_input = {
+                "markdown": markdown,
+                "source_url": url,
+                "tech_category": category if category != "all" else None,
+                "chunk_size": self.config.CHUNK_SIZE,
+                "chunk_overlap": self.config.CHUNK_OVERLAP,
+            }
+            documents.append(doc_input)
+
+            # 记录原始 MD 文件路径（用于关联）
+            # 文件名格式：{日期}_{序号:03d}_{清理后的标题}.md
+            try:
+                title = result.get("title", result.get("original_title", "Untitled"))
+                # 简单清理标题用于文件名
+                import re
+                clean_title = re.sub(r"[^a-zA-Z0-9一-龥_\-]", "_", title)[:30]
+                md_filename = f"{date_str}_{len(raw_md_paths):03d}_{clean_title}.md"
+                md_path = f"{date_str}/{category}/{md_filename}"
+                raw_md_paths.append(md_path)
+            except Exception as e:
+                logger.debug(f"文档处理阶段：构建 MD 路径失败：{e}")
+                raw_md_paths.append(f"{date_str}/{category}/unknown.md")
+
+        # 批量处理
+        process_results = self.local_doc_pipeline.process(documents)
+
+        # 统计
+        success_count = sum(1 for r in process_results if r.get("status") == "success")
+        failed_count = len(process_results) - success_count
+
+        self._stats["process_success"] = success_count
+        self._stats["process_failed"] = failed_count
+
+        logger.info(
+            f"文档处理阶段完成，成功 {success_count}, 失败 {failed_count}"
+        )
+
+        # 保存处理结果（如果配置启用）
+        if self.config.SAVE_PROCESSED_RESULT:
+            try:
+                save_result = self.result_manager.save_batch_results(
+                    results=process_results,
+                    raw_md_paths=raw_md_paths,
+                    date_str=date_str,
+                )
+                logger.info(
+                    f"文档处理阶段：保存结果完成 - 成功 {save_result['saved_count']}, "
+                    f"失败 {save_result['failed_count']}"
+                )
+            except Exception as e:
+                logger.error(f"文档处理阶段：保存结果失败：{e}")
+                # 不中断主流程
+
+        return process_results
+
     def _print_stats(self) -> None:
         """打印统计信息"""
         print("\n" + "=" * 50)
@@ -445,6 +572,9 @@ class CrawlPipeline:
         print(f"抓取成功：{self._stats['fetch_success']} 条")
         print(f"抓取失败：{self._stats['fetch_failed']} 条")
         print(f"文件保存：{self._stats['saved_count']} 个")
+        if "process_success" in self._stats:
+            print(f"文档处理成功：{self._stats['process_success']} 条")
+            print(f"文档处理失败：{self._stats['process_failed']} 条")
         print("=" * 50 + "\n")
 
 
@@ -454,13 +584,13 @@ async def main():
     config = CrawlerConfig()
 
     # 使用封装日志工具初始化
-    logger = init_logger(
-        logs_path=config.LOGS_PATH,
-        log_level=config.LOG_LEVEL,
-        log_name="crawl_pipeline",
-    )
+    # logger = init_logger(
+    #     logs_path=config.LOGS_PATH,
+    #     log_level=config.LOG_LEVEL,
+    #     log_name="crawl_pipeline",
+    # )
 
-    logger.info("知识采集流水线启动")
+    # logger.info("知识采集流水线启动")
 
     # 创建流水线并执行
     pipeline = CrawlPipeline(config)

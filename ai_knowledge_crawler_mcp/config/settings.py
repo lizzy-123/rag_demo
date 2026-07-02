@@ -25,9 +25,10 @@ class CrawlerConfig:
     )
 
     # 英文素材关键词（可选扩展）
-    ENGLISH_KEYWORDS: List[str] = field(
-        default_factory=lambda: ["LLM RAG", "Multi-Agent Systems", "LangChain", "Vector Database"]
-    )
+    # ENGLISH_KEYWORDS: List[str] = field(
+    #     default_factory=lambda: ["LLM RAG", "Multi-Agent Systems", "LangChain", "Vector Database"]
+    # )
+
 
     # ========== 定时任务配置 ==========
     # 定时间隔（小时）
@@ -68,7 +69,21 @@ class CrawlerConfig:
     FETCH_MCP_STREAM_URL: str = "https://mcp.api-inference.modelscope.net/955c976957164d/mcp"
 
     # 文档处理 MCP（LLM）
-    DOC_PROCESSOR_MCP_URL: str = "http://127.0.0.1:8012/mcp"
+    DOC_PROCESSOR_MCP_URL: str = "http://127.0.0.1:8085/mcp"
+
+    # ========== 本地文档处理器配置 ==========
+    # 是否使用本地文档处理器（True=本地模块，False=远程 MCP 服务）
+    USE_LOCAL_DOC_PROCESSOR: bool = True
+
+    # 是否保存处理结果到磁盘
+    SAVE_PROCESSED_RESULT: bool = True
+
+    # 本地文档处理器配置
+    # 是否使用语义去重
+    USE_SEMANTIC_DEDUP: bool = True
+
+    # 语义相似度阈值（0~0.85）
+    LOCAL_DEDUP_THRESHOLD: float = 0.85
 
     # ========== 抓取配置 ==========
     # 云端 Fetch MCP 超时时间（秒）
@@ -223,4 +238,12 @@ class CrawlerConfig:
                 "FETCH_MCP_STREAM_URL 必须是有效的 HTTP/HTTPS 地址",
                 field_name="FETCH_MCP_STREAM_URL",
                 value=self.FETCH_MCP_STREAM_URL
+            )
+
+        # 校验本地文档处理器配置
+        if not 0 <= self.LOCAL_DEDUP_THRESHOLD <= 0.85:
+            raise ConfigValidateError(
+                "LOCAL_DEDUP_THRESHOLD 必须在 0~0.85 之间",
+                field_name="LOCAL_DEDUP_THRESHOLD",
+                value=self.LOCAL_DEDUP_THRESHOLD
             )

@@ -14,15 +14,9 @@ from datetime import datetime
 from logging import Handler, LogRecord
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
-from pathlib import Path
-from pathlib import Path
-from pathlib import Path
-from pathlib import Path
-from pathlib import Path
-from pathlib import Path
-from pathlib import Path
+
 from typing import Optional
-from pathlib import Path
+
 
 
 class ColoredFormatter(logging.Formatter):
